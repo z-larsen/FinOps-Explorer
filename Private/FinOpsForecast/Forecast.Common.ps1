@@ -30,13 +30,31 @@ $script:ForecastDateFormats = [string[]]@(
 )
 
 function New-ForecastIssue {
+    # Scope names the run group an issue belongs to, so a check can show one
+    # line for each scope instead of one scope's every month.
     param(
         [Parameter(Mandatory)][string]$Code,
         [ValidateSet('Fail', 'Warn', 'Info')][string]$Severity = 'Fail',
         [Parameter(Mandatory)][string]$Message,
-        [string]$Subject
+        [string]$Subject,
+        [string]$Scope
     )
-    [pscustomobject]@{ Code = $Code; Severity = $Severity; Message = $Message; Subject = $Subject }
+    $issue = [pscustomobject]@{ Code = $Code; Severity = $Severity; Message = $Message; Subject = $Subject }
+    if ($Scope) { $issue | Add-Member -NotePropertyName Scope -NotePropertyValue $Scope }
+    $issue
+}
+
+function Get-ForecastSourceCountText {
+    # "124 live source(s)", "2 export source(s)", or both. Cost Details
+    # sources are live reads, not exports.
+    param([AllowEmptyCollection()][object[]]$Sources = @())
+    $live = @($Sources | Where-Object { $_ -and [string]$_.kind -eq 'CostDetails' }).Count
+    $exports = @($Sources | Where-Object { $_ }).Count - $live
+    $parts = @()
+    if ($exports) { $parts += "$exports export source(s)" }
+    if ($live) { $parts += "$live live source(s)" }
+    if (-not $parts.Count) { return '0 sources' }
+    return $parts -join ' and '
 }
 
 # Reconciliation differences below a millionth of a currency unit are decimal
@@ -145,6 +163,18 @@ function Get-ForecastMonthDifference {
     return (($b.Year - $a.Year) * 12) + ($b.Month - $a.Month)
 }
 
+function Join-ForecastMonthList {
+    # "2026-08", "2026-07 and 2026-08", "2026-07, 2026-09, and 2026-11", or
+    # "2026-07 to 2026-10" for three or more months in a row.
+    param([AllowEmptyCollection()][string[]]$Months)
+    $sorted = @($Months | Where-Object { $_ } | Sort-Object -Unique)
+    if ($sorted.Count -le 1) { return [string]($sorted -join '') }
+    if ($sorted.Count -eq 2) { return "$($sorted[0]) and $($sorted[1])" }
+    $inRow = (Get-ForecastMonthDifference -First $sorted[0] -Second $sorted[-1]) -eq $sorted.Count - 1
+    if ($inRow) { return "$($sorted[0]) to $($sorted[-1])" }
+    return "$(($sorted | Select-Object -SkipLast 1) -join ', '), and $($sorted[-1])"
+}
+
 function ConvertFrom-ForecastDate {
     # Parses an export or manifest date as UTC. Returns $null when unreadable.
     param([AllowNull()]$Value)
@@ -172,9 +202,10 @@ function Get-ForecastMonthEnd {
 
 function Get-ForecastLastEligibleMonth {
     # The latest month that has closed and passed the finalization grace
-    # period as of AsOf. Azure closes a billing period up to 72 hours after
-    # it ends, so the default grace is three days.
-    param([Parameter(Mandatory)][datetime]$AsOf, [int]$GraceDays = 3)
+    # period as of AsOf. Usage can change until the fifth day after a month
+    # ends, so by default a month is final from 00:00 UTC on that day, four
+    # days after it ends (ForecastDefaultGraceDays).
+    param([Parameter(Mandatory)][datetime]$AsOf, [int]$GraceDays = $script:ForecastDefaultGraceDays)
     $asOfUtc = ConvertFrom-ForecastDate -Value $AsOf
     $candidate = ConvertTo-ForecastMonthKey -Date $asOfUtc
     for ($i = 0; $i -lt 3; $i++) {

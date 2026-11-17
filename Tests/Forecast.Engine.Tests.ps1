@@ -6,7 +6,7 @@
 param()
 BeforeAll {
     . (Join-Path $PSScriptRoot 'Forecast.TestHelpers.ps1')
-    $script:AsOf = [datetime]::SpecifyKind([datetime]'2026-11-05T12:00:00', [DateTimeKind]::Utc)
+    $script:AsOf = [datetime]::SpecifyKind([datetime]'2026-11-07T12:00:00', [DateTimeKind]::Utc)
     $script:Window = Get-TestMonthKeys -Last '2026-10'
 
     function New-RateSeries {
@@ -45,6 +45,36 @@ Describe 'Forecast engine' {
             @($model.Comparisons.Items | Where-Object Status -EQ 'Defined').Count | Should -Be 11
         }
 
+        It 'Asks for a review of each change between months on different agreements, and counts it until decided' {
+            $rates = [decimal[]](1000, 1020, 1040, 1061, 1082, 1104, 1126, 1149, 1172, 1195, 1219, 1243)
+            $dataset = New-TestDataset -Values (New-RateSeries $rates)
+            # EA until June, both in the month of the move, then MCA.
+            foreach ($row in $dataset.Months) {
+                $agreements = if ([string]::CompareOrdinal($row.Month, '2026-07') -lt 0) { @('EA') } elseif ($row.Month -eq '2026-07') { @('EA', 'MCA') } else { @('MCA') }
+                $row | Add-Member -NotePropertyName Agreements -NotePropertyValue $agreements
+            }
+            $settings = New-TestSettings
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            (@($model.Comparisons.Items | Where-Object AgreementChange | ForEach-Object { "$($_.FromMonth) to $($_.ToMonth)" }) -join ', ') | Should -Be '2026-06 to 2026-07, 2026-07 to 2026-08'
+            $reviews = @($model.Reviews | Where-Object Category -EQ 'AgreementChange')
+            $reviews.Count | Should -Be 2
+            foreach ($review in $reviews) {
+                $review.Required | Should -BeTrue
+                $review.Decision | Should -Be 'Pending'
+                $review.Detail | Should -Match 'EA and MCA prices can differ'
+            }
+            @($model.Comparisons.Items | Where-Object { $_.AgreementChange -and $_.Retained }).Count | Should -Be 2 -Because 'a pending review leaves the change in growth, so the numbers move only after a decision'
+
+            $excluded = Invoke-TestModel -Dataset $dataset -Settings $settings -Reviews (New-ReviewRecord $reviews[0] 'Exclude')
+            @($excluded.Comparisons.Items | Where-Object ToMonth -EQ '2026-07')[0].Retained | Should -BeFalse
+            $excluded.Growth.Retained | Should -Be 10
+
+            $settings.method.reviewAgreementChange = $false
+            $off = Invoke-TestModel -Dataset $dataset -Settings $settings
+            @($off.Reviews | Where-Object Category -EQ 'AgreementChange').Count | Should -Be 0
+            $off.Projection.TotalCentral | Should -Be $model.Projection.TotalCentral
+        }
+
         It 'Orders months by date key, not by the order rows arrive in' {
             $rates = [decimal[]](1000, 1100, 1050, 1200, 1180, 1250, 1300, 1280, 1350, 1400, 1390, 1450)
             $ordered = New-TestDataset -Values (New-RateSeries $rates)
@@ -79,7 +109,7 @@ Describe 'Forecast engine' {
             @($reviewed.Comparisons.Items | Where-Object Status -EQ 'Undefined')[0].Review.Decision | Should -Be 'Exclude'
         }
 
-        It 'Flags a sustained jump and suggests a step change that keeps genuine growth' {
+        It 'Flags a sustained jump, suggests a step change, and leaves it out of growth unless retained' {
             $rates = [decimal[]](1000, 1010, 1020, 1030, 1040, 1600, 1616, 1632, 1648, 1664, 1680, 1696)
             $dataset = New-TestDataset -Values (New-RateSeries $rates)
             $model = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings)
@@ -89,9 +119,63 @@ Describe 'Forecast engine' {
             $flagged[0].Suggestion | Should -Be 'StepChange'
             $flagged[0].Retained | Should -BeFalse
 
-            $reviewed = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings) -Reviews (New-ReviewRecord $flagged[0].Review 'StepChange')
-            @($reviewed.Comparisons.Items | Where-Object Flagged)[0].Retained | Should -BeTrue
-            $reviewed.Growth.Retained | Should -Be 11
+            # A step change is a one-time move to a new level that the baseline already reflects.
+            $stepped = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings) -Reviews (New-ReviewRecord $flagged[0].Review 'StepChange')
+            @($stepped.Comparisons.Items | Where-Object Flagged)[0].Retained | Should -BeFalse
+            @($stepped.Comparisons.Items | Where-Object Flagged)[0].Reason | Should -Match 'left out of growth'
+            $stepped.Growth.Retained | Should -Be 10
+            $kept = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings) -Reviews (New-ReviewRecord $flagged[0].Review 'Retain')
+            @($kept.Comparisons.Items | Where-Object Flagged)[0].Retained | Should -BeTrue
+            $kept.Growth.Retained | Should -Be 11
+        }
+
+        It 'Uses the lowest to highest change while the lookback is under 12 months, and P25 to P75 from 12' {
+            $comparisons = [pscustomobject]@{ Items = @(0.01, 0.04, 0.02 | ForEach-Object { [pscustomobject]@{ Retained = $true; Change = [decimal]$_ } }) }
+            $short = New-TestSettings
+            $short.period.lookbackMonths = 4
+            InModuleScope FinOpsForecast -Parameters @{ Comparisons = $comparisons; Short = $short; Full = (New-TestSettings) } {
+                $growth = Get-ForecastGrowth -Comparisons $Comparisons -Settings $Short
+                $growth.RangeMethod | Should -Be 'LowestToHighest'
+                $growth.Central | Should -Be 0.02
+                @($growth.Low, $growth.High) | Should -Be @(0.01, 0.04)
+                # Linear interpolation between ranks, like Excel PERCENTILE.INC.
+                $growth = Get-ForecastGrowth -Comparisons $Comparisons -Settings $Full
+                $growth.RangeMethod | Should -Be 'Percentile'
+                @($growth.Low, $growth.High) | Should -Be @(0.015, 0.03)
+            }
+        }
+
+        It 'Lets a change that isn''t flagged be reviewed by hand, even with only two changes' {
+            # Run rates 1000, 500, and 510: two changes can't be flagged, but the drop is new commitments covering usage.
+            $settings = New-TestSettings
+            $settings.period.lookbackMonths = 3
+            $settings.method.minimumRetained = 1
+            $dataset = New-TestDataset -Values (New-RateSeries -Rates ([decimal[]](1000, 500, 510)) -Months (Get-TestMonthKeys -Last '2026-10' -Count 3))
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            @($model.Comparisons.Items | Where-Object Flagged).Count | Should -Be 0
+            $model.Growth.Central | Should -Be (-0.24)
+            $drop = InModuleScope FinOpsForecast -Parameters @{ Change = $model.Comparisons.Items[0]; ScopeKey = $model.ScopeKey } { New-ForecastComparisonReview -Comparison $Change -ScopeKey $ScopeKey }
+            $reviews = New-ReviewRecord $drop 'StepChange'
+            $stepped = Invoke-TestModel -Dataset $dataset -Settings $settings -Reviews $reviews
+            $stepped.Comparisons.Items[0].Retained | Should -BeFalse
+            $stepped.Comparisons.Items[0].Reason | Should -Match 'left out of growth'
+            $stepped.Growth.Central | Should -Be 0.02
+            @($stepped.Reviews | Where-Object { $_.Category -eq 'Comparison' -and $_.Decision -eq 'StepChange' }).Count | Should -Be 1
+            $stepped.Baseline.Review | Should -BeNullOrEmpty
+            $disclosure = InModuleScope FinOpsForecast -Parameters @{ Model = $stepped; Dataset = $dataset; Settings = $settings; AsOf = $script:AsOf } {
+                $readiness = Test-ForecastReadiness -Dataset $Dataset -Model $Model -Settings $Settings -AsOf $AsOf
+                (Get-ForecastDisclosure -Model $Model -Dataset $Dataset -Settings $Settings -Readiness $readiness) -join "`n"
+            }
+            $disclosure | Should -Match '0 flagged, 1 reviewed by hand\.'
+            $disclosure | Should -Match '2026-08 to 2026-09: Defined, change -50\.0%, decision StepChange, retained False'
+
+            # Excluding the latest change by hand also asks for the baseline.
+            $latest = InModuleScope FinOpsForecast -Parameters @{ Change = $model.Comparisons.Items[1]; ScopeKey = $model.ScopeKey } { New-ForecastComparisonReview -Comparison $Change -ScopeKey $ScopeKey }
+            $reviews += New-ReviewRecord $latest 'Exclude'
+            $excluded = Invoke-TestModel -Dataset $dataset -Settings $settings -Reviews $reviews
+            $excluded.Comparisons.Items[1].Retained | Should -BeFalse
+            $excluded.Baseline.Review.Suggested | Should -Be 'MedianLast3'
+            $excluded.Baseline.Pending | Should -BeTrue
         }
 
         It 'Suggests excluding a one-month spike and keeps the month in actuals' {
@@ -159,6 +243,24 @@ Describe 'Forecast engine' {
             $model.Baseline.Pending | Should -BeFalse
             # The synthetic rate-to-cost conversion divides by 30, so compare at eight decimals.
             [decimal]::Round($model.Baseline.Value, 8) | Should -Be ([decimal]$Expected)
+        }
+
+        It 'Suggests the latest month after a step change into it, and asks again if the baseline was answered first' {
+            $rates = [decimal[]](@(1..11 | ForEach-Object { 1000 }) + 500)
+            $dataset = New-TestDataset -Values (New-RateSeries $rates)
+            $model = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings)
+            $model.Baseline.Review.Suggested | Should -Be 'MedianLast3'
+            # Exceptions lists the baseline review before the change it depends on.
+            $reviews = New-ReviewRecord $model.Baseline.Review 'MedianLast3'
+            $reviews += New-ReviewRecord @($model.Comparisons.Items)[-1].Review 'StepChange'
+            $stepped = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings) -Reviews $reviews
+            $stepped.Baseline.Review.Suggested | Should -Be 'LatestMonth'
+            $stepped.Baseline.Review.Stale | Should -BeTrue
+            $stepped.Baseline.Pending | Should -BeTrue
+            $reviews[$stepped.Baseline.Review.Key] = [pscustomobject]@{ decision = 'LatestMonth'; fingerprint = $stepped.Baseline.Review.Fingerprint; note = 'synthetic review'; value = $null }
+            $answered = Invoke-TestModel -Dataset $dataset -Settings (New-TestSettings) -Reviews $reviews
+            $answered.Baseline.Pending | Should -BeFalse
+            [decimal]::Round($answered.Baseline.Value, 8) | Should -Be 500
         }
     }
 
@@ -271,6 +373,112 @@ Describe 'Forecast engine' {
             $model = Invoke-TestModel -Dataset (New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))) -Settings $settings
             @($model.Schedule.Issues | Where-Object Code -EQ 'SCH-DUPLICATE').Count | Should -Be 1
             @($model.Reviews | Where-Object Category -EQ 'Schedule').Count | Should -Be 1
+        }
+
+        It 'Counts a scheduled item only in months that haven''t ended, and warns when it changes nothing' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))
+            $settings = New-TestSettings -StartMonth 1
+            $item = @{ description = 'synthetic'; endMonth = ''; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = '' }
+            $settings.scheduledItems = @(
+                [pscustomobject](@{ id = 'misdated'; type = 'BusinessChange'; startMonth = '2026-08'; recurrence = 'OneTime'; amount = '100' } + $item)
+                [pscustomobject](@{ id = 'next-year'; type = 'Purchase'; startMonth = '2027-03'; recurrence = 'OneTime'; amount = '100' } + $item)
+                [pscustomobject](@{ id = 'monthly'; type = 'Purchase'; startMonth = '2026-09'; recurrence = 'Monthly'; amount = '10' } + $item)
+            )
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $model.Projection.Scheduled | Should -Be 20 -Because 'only November and December are still to come'
+            (@($model.ScheduleSummary) | ForEach-Object { "$($_.Id)=$($_.Status)" }) -join ', ' | Should -Be 'misdated=No effect, next-year=No effect, monthly=Partly counted'
+            (@($model.ScheduleEffects | Where-Object { $_.Id -eq 'monthly' -and -not $_.Counted }) | ForEach-Object { "$($_.Month) $($_.Status)" }) -join ', ' | Should -Be '2026-09 PastMonth, 2026-10 PastMonth'
+            $warnings = @($model.Issues | Where-Object Code -EQ 'SCH-NOEFFECT')
+            $warnings.Severity | Should -Be @('Warn', 'Warn')
+            $warnings[0].Message | Should -Be 'Scheduled item misdated changes nothing in FY2026: 2026-08 has already ended, so only actual cost counts there. To add cost that''s already billed but isn''t in the data, make it an external actual.'
+            $warnings[1].Message | Should -Be 'Scheduled item next-year changes nothing in FY2026: it has no occurrence from 2026-01 to 2026-12.'
+            $keys = InModuleScope FinOpsForecast -Parameters @{ Dataset = $dataset; Model = $model; Settings = $settings; AsOf = $script:AsOf } {
+                @((Test-ForecastReadiness -Dataset $Dataset -Model $Model -Settings $Settings -AsOf $AsOf).Checks | Where-Object Id -EQ 'KEYS')[0]
+            }
+            $keys.Status | Should -Be 'Warn' -Because 'the forecast is still right without the item'
+            $keys.Detail | Should -Match '^Scheduled item misdated changes nothing'
+        }
+
+        It 'Adds an external actual to its month''s actuals, never to growth' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]](1000, 1020, 1040, 1061, 1082, 1104, 1126, 1149, 1172, 1195, 1219, 1243)))
+            $settings = New-TestSettings -StartMonth 1
+            $before = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $item = @{ type = 'ExternalActual'; endMonth = ''; recurrence = 'OneTime'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = '' }
+            $settings.scheduledItems = @(
+                [pscustomobject](@{ id = 'ea-july'; description = 'EA charges before the move'; startMonth = '2026-07'; amount = '500' } + $item)
+                [pscustomobject](@{ id = 'too-soon'; description = 'Not billed yet'; startMonth = '2026-12'; amount = '70' } + $item)
+            )
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $july = @($model.Projection.Rows | Where-Object Month -EQ '2026-07')[0]
+            $july.AddedActual | Should -Be 500
+            $july.TotalCentral | Should -Be ($july.Actual + 500)
+            $model.Projection.AddedActual | Should -Be 500
+            $model.Projection.ActualToDate | Should -Be $before.Projection.ActualToDate
+            $model.Projection.Scheduled | Should -Be 0
+            foreach ($path in 'TotalLow', 'TotalCentral', 'TotalHigh') { $model.Projection.$path | Should -Be ($before.Projection.$path + 500) -Because $path }
+            $model.Growth.Central | Should -Be $before.Growth.Central
+            $model.Baseline.Value | Should -Be $before.Baseline.Value
+            @($model.Issues | Where-Object Code -EQ 'SCH-NOEFFECT').Message | Should -Be 'Scheduled item too-soon changes nothing in FY2026: 2026-12 hasn''t started, and an external actual adds only to a month that has.'
+            $settings.scheduledItems = @([pscustomobject](@{ id = 'every-month'; description = 'synthetic'; startMonth = '2026-07'; amount = '500' } + $item))
+            $settings.scheduledItems[0].recurrence = 'Monthly'
+            $settings.scheduledItems[0].baselineTreatment = 'AlreadyInBaseline'
+            @((Invoke-TestModel -Dataset $dataset -Settings $settings).Schedule.Issues | Where-Object Code -EQ 'SCH-INVALID').Message |
+                Should -Be 'Scheduled item every-month: an external actual is one month''s cost, so its recurrence must be OneTime; an external actual adds to that month''s actuals, so its treatment must be Additive.'
+        }
+
+        It 'Proposes an annual renewal for an up-front purchase that would bill again within the fiscal year' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))
+            $dataset.SubscriptionNames = @{ 'sub-synth-1' = 'sub-synth-one' }
+            $cell = { param($Month, $Commitment, $Cost, $Frequency = 'OneTime', $ChargeType = 'Purchase') [pscustomobject]@{ Month = $Month; Stream = 'Purchase'; ChargeType = $ChargeType; CommitmentId = $Commitment; Frequency = $Frequency; PricingModel = 'Reservation'; SubscriptionId = 'sub-synth-1'; Cost = [decimal]$Cost } }
+            $dataset.Cells = @(
+                & $cell '2025-12' 'ri-upfront' 1200
+                # None of these would bill again in FY2026: a later anniversary, a refund, a monthly charge, a second charge, a purchase before the window, and one already scheduled.
+                & $cell '2026-02' 'ri-later' 900
+                & $cell '2025-11' 'ri-refunded' 400; & $cell '2026-01' 'ri-refunded' -400 'OneTime' 'Refund'
+                & $cell '2025-12' 'ri-monthly' 50 'Recurring'
+                & $cell '2025-11' 'ri-twice' 80; & $cell '2025-12' 'ri-twice' 80
+                & $cell '2025-10' 'ri-old' 60
+                & $cell '2025-12' 'ri-scheduled' 300
+            )
+            $settings = New-TestSettings -StartMonth 1
+            $settings.scheduledItems = @([pscustomobject]@{ id = 'covered'; type = 'Renewal'; description = 'synthetic'; startMonth = '2026-12'; endMonth = ''; recurrence = 'Annual'; amount = '300'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = 'ri-scheduled' })
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $reviews = @($model.Reviews | Where-Object Category -EQ 'RenewalPurchase')
+            $reviews.Count | Should -Be 1
+            $reviews[0].Required | Should -BeTrue
+            $reviews[0].Decision | Should -Be 'Pending'
+            @($reviews[0].Options) -join ',' | Should -Be 'Scheduled,NotRenewing'
+            $reviews[0].Detail | Should -Match '^Commitment ri-upfront was billed 1,200\.00 once, up front, in 2025-12 by sub-synth-one\. If its term is one year and it renews, it bills again in 2026-12, within FY2026\. Cost data doesn''t show the term, so check it under Reservations in the Azure portal'
+            $proposal = $reviews[0].Proposal
+            $proposal.id | Should -Match '^renewal-[0-9a-f]{8}$'
+            "$($proposal.type) $($proposal.recurrence) $($proposal.startMonth) $($proposal.amount) $($proposal.baselineTreatment) $($proposal.commitmentId) [$($proposal.endMonth)]" | Should -Be 'Renewal Annual 2026-12 1200 Additive ri-upfront []'
+            $proposal.description | Should -Be 'Possible renewal of an up-front purchase, paid by sub-synth-one'
+            $model.Projection.Scheduled | Should -Be 300 -Because 'a pending proposal changes nothing'
+            $settings.scheduledItems = @($settings.scheduledItems) + $proposal
+            $added = Invoke-TestModel -Dataset $dataset -Settings $settings
+            @($added.Reviews | Where-Object Category -EQ 'RenewalPurchase').Count | Should -Be 0
+            @($added.Projection.Rows | Where-Object Month -EQ '2026-12')[0].Scheduled | Should -Be 1500
+            # Forecasting next year, the first anniversary comes before it and the second falls in it.
+            $settings.scheduledItems = @($settings.scheduledItems[0])
+            $settings.period.fiscalYearOffset = 1
+            $next = @((Invoke-TestModel -Dataset $dataset -Settings $settings).Reviews | Where-Object Category -EQ 'RenewalPurchase')
+            ($next.Subject | Sort-Object) -join ', ' | Should -Be 'ri-later, ri-upfront' -Because 'the purchase from February 2026 would bill again in February 2027'
+            $upfront = @($next | Where-Object Subject -EQ 'ri-upfront')[0]
+            $upfront.Detail | Should -Match 'it bills again in 2026-12, and each year after, including 2027-12, within FY2027\.'
+            $upfront.Proposal.startMonth | Should -Be '2026-12'
+        }
+
+        It 'Notes a renewal that may have posted under a new order ID this month' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))
+            $month = (New-TestDataset -Values ([ordered]@{ '2026-11' = 900 })).Months[0]
+            $month.Status = 'Provisional'; $month.DataThrough = [datetime]'2026-11-04'
+            $dataset.Months += $month
+            $dataset.Cells = @([pscustomobject]@{ Month = '2026-11'; Stream = 'Purchase'; ChargeType = 'Purchase'; CommitmentId = 'ri-new-order'; Cost = 500d })
+            $settings = New-TestSettings -StartMonth 1
+            $settings.scheduledItems = @([pscustomobject]@{ id = 'renewal-synth'; type = 'Renewal'; description = 'synthetic'; startMonth = '2026-11'; endMonth = ''; recurrence = 'Annual'; amount = '500'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = 'ri-old-order' })
+            $november = @((Invoke-TestModel -Dataset $dataset -Settings $settings).Projection.Rows | Where-Object Month -EQ '2026-11')[0]
+            $november.Scheduled | Should -Be 500
+            $november.Note | Should -Match 'renewal item\(s\) renewal-synth may have posted under a new order ID, so check they aren''t already in the actuals\.'
         }
     }
 
