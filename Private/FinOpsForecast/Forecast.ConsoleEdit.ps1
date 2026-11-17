@@ -14,6 +14,17 @@ param()
 # that apply, so problems surface where they're fixed.
 ###########################################################################
 
+function Get-ForecastProposalText {
+    # "30.00 a month from 2026-11", "1,200.00 a year from 2026-12", or "500.00 once, in 2026-07".
+    param([Parameter(Mandatory)]$Proposal)
+    $amount = Format-ForecastAmount (Read-ForecastDecimal $Proposal.amount)
+    switch ([string]$Proposal.recurrence) {
+        'Monthly' { return "$amount a month from $($Proposal.startMonth)" }
+        'Annual' { return "$amount a year from $($Proposal.startMonth)" }
+        default { return "$amount once, in $($Proposal.startMonth)" }
+    }
+}
+
 function Add-ForecastProposedItem {
     # Adds a proposed scheduled item, such as a recurring purchase found in
     # the history, after the same checks as an item entered by hand.
@@ -25,8 +36,39 @@ function Add-ForecastProposedItem {
     if ($problems.Count) { foreach ($problem in $problems) { Write-FinOpsConsole "  ! $($problem.Message)" -ForegroundColor Yellow }; return $false }
     $settings.scheduledItems = @($items + $Proposal)
     Save-ForecastSettingsWithFeedback -Root $Root -Settings $settings
-    Write-FinOpsConsole "  Added scheduled item $($Proposal.id): $(Format-ForecastAmount (Read-ForecastDecimal $Proposal.amount)) a month from $($Proposal.startMonth), with no end month. If the commitment ends sooner, set its end month in 4 Assumptions, S." -ForegroundColor Cyan
+    $ending = if ([string]$Proposal.recurrence -eq 'Annual') { 'If it won''t renew after that, set its end month in 4 Assumptions, S.' } else { 'If the commitment ends sooner, set its end month in 4 Assumptions, S.' }
+    Write-FinOpsConsole "  Added scheduled item $($Proposal.id): $(Get-ForecastProposalText -Proposal $Proposal), with no end month. $ending" -ForegroundColor Cyan
     return $true
+}
+
+function Get-ForecastScheduleView {
+    # What each scheduled item adds to the fiscal year, measured against the
+    # session's data with the settings as they are now. Without a session,
+    # such as when the workspace couldn't be evaluated, there's nothing to
+    # measure against, so it returns $null.
+    param([Parameter(Mandatory)]$Settings, $Session)
+    if (-not $Session -or -not $Session.Dataset) { return $null }
+    try {
+        $model = Invoke-ForecastModel -Dataset $Session.Dataset -Settings $Settings -Reviews $Session.Reviews -AsOf $Session.AsOf
+        return [pscustomobject]@{ Label = [string]$model.FiscalYear.Label; Items = @($model.ScheduleSummary | Where-Object { $_ }) }
+    }
+    catch {
+        Write-Verbose "Scheduled items couldn't be measured: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Write-ForecastScheduleEffect {
+    # One line on what a scheduled item adds, after it's saved.
+    param([Parameter(Mandatory)][string]$Id, $View)
+    $row = if ($View) { @($View.Items | Where-Object { [string]$_.Id -eq $Id })[0] } else { $null }
+    if (-not $row) { return }
+    switch ($row.Status) {
+        'No effect' { Write-FinOpsConsole "  ! $Id changes nothing in $($View.Label). $($row.Note)" -ForegroundColor Yellow }
+        'Already posted' { Write-FinOpsConsole "  $Id adds nothing more to $($View.Label). $($row.Note)" -ForegroundColor Cyan }
+        'Partly counted' { Write-FinOpsConsole "  $Id adds $(Format-ForecastAmount $row.Added) to $($View.Label). $($row.Note)" -ForegroundColor Cyan }
+        default { Write-FinOpsConsole "  $Id adds $(Format-ForecastAmount $row.Added) to $($View.Label)." -ForegroundColor Cyan }
+    }
 }
 
 function Save-ForecastSettingsWithFeedback {
@@ -333,7 +375,7 @@ function Edit-ForecastPeriod {
 }
 
 function Edit-ForecastAssumptions {
-    param([Parameter(Mandatory)][string]$Root)
+    param([Parameter(Mandatory)][string]$Root, $Session)
     while ($true) {
         $settings = Get-ForecastStoredSettings -Root $Root
         Clear-ForecastScreen
@@ -374,28 +416,41 @@ function Edit-ForecastAssumptions {
                 foreach ($issue in @((Import-ForecastWorkloadMapping -Path $settings.workloads.mappingPath).Issues)) { Write-FinOpsConsole "  ! $($issue.Message)" -ForegroundColor Yellow }
                 Wait-ForecastKey
             }
-            'S' { Edit-ForecastScheduledItems -Root $Root }
+            'S' { Edit-ForecastScheduledItems -Root $Root -Session $Session }
             default { return }
         }
     }
 }
 
 function Edit-ForecastScheduledItems {
-    param([Parameter(Mandatory)][string]$Root)
+    param([Parameter(Mandatory)][string]$Root, $Session)
     while ($true) {
         $settings = Get-ForecastStoredSettings -Root $Root
+        $view = Get-ForecastScheduleView -Settings $settings -Session $Session
+        $effects = @{}
+        if ($view) { foreach ($row in $view.Items) { $effects[[string]$row.Id] = $row } }
         Clear-ForecastScreen
-        Write-ForecastHeading -Title 'Scheduled purchases, renewals, and business changes'
+        Write-ForecastHeading -Title 'Scheduled purchases, renewals, business changes, and external actuals'
         $items = @($settings.scheduledItems)
+        $format = '  {0,2}  {1,-18} {2,-14} {3,-9} {4,-8} {5,14}  {6,-22} {7}'
+        if ($items.Count) { Write-FinOpsConsole ($format -f '#', 'ID', 'Type', 'Repeats', 'From', 'Amount', 'Treatment', $(if ($view) { "In $($view.Label)" } else { '' })) -ForegroundColor DarkGray }
         for ($i = 0; $i -lt $items.Count; $i++) {
             $item = $items[$i]
-            Write-FinOpsConsole ('  {0,2}  {1,-18} {2,-14} {3,-9} {4,-8} {5,14}  {6}' -f ($i + 1), (ConvertTo-ForecastSafeText $item.id 18), $item.type, $item.recurrence, $item.startMonth, (Format-ForecastAmount (Read-ForecastDecimal $item.amount)), $item.baselineTreatment)
+            $row = $effects[[string]$item.id]
+            $effect = if (-not $view) { '' } elseif (-not $row) { 'not valid' } elseif ($row.Status -eq 'No effect') { 'no effect' } elseif ($row.Status -eq 'Already posted') { 'already posted' } else { "adds $(Format-ForecastAmount $row.Added)" }
+            $color = if ($effect -in 'no effect', 'not valid') { 'Yellow' } else { 'Gray' }
+            Write-FinOpsConsole ($format -f ($i + 1), (ConvertTo-ForecastSafeText $item.id 18), $item.type, $item.recurrence, $item.startMonth, (Format-ForecastAmount (Read-ForecastDecimal $item.amount)), $item.baselineTreatment, $effect) -ForegroundColor $color
         }
         if ($items.Count -eq 0) { Write-FinOpsConsole '  None.' -ForegroundColor DarkGray }
+        # Why an item adds nothing, or leaves out some of its months.
+        foreach ($row in @($view.Items | Where-Object { $_ -and $_.Status -in 'No effect', 'Partly counted' })) {
+            Write-FinOpsConsole "  $(if ($row.Status -eq 'No effect') { '! ' })$($row.Id): $($row.Note)" -ForegroundColor $(if ($row.Status -eq 'No effect') { 'Yellow' } else { 'DarkGray' })
+        }
         Write-FinOpsConsole '  Treatment: Additive adds the amount; AlreadyInBaseline adds nothing (the run rate already includes it); ReplacesBaselineAmount adds amount minus the replaced amount.' -ForegroundColor DarkGray
-        Write-FinOpsConsole '  A Add   E Edit   X Remove   B Back' -ForegroundColor DarkGray
-        $choice = Read-ForecastChoice -Prompt 'Choose' -Valid @('A', 'E', 'X', 'B') -Default 'B'
+        Write-FinOpsConsole '  A Add   E Edit   X Remove   H How these work   B Back' -ForegroundColor DarkGray
+        $choice = Read-ForecastChoice -Prompt 'Choose' -Valid @('A', 'E', 'X', 'H', 'B') -Default 'B'
         if ($choice -in '', 'B') { return }
+        if ($choice -eq 'H') { Show-ForecastScheduleHelp -Topic Scheduled -FiscalYearLabel $(if ($view) { $view.Label }); continue }
         $index = -1
         if ($choice -in 'E', 'X') {
             $number = 0
@@ -407,28 +462,49 @@ function Edit-ForecastScheduledItems {
             Save-ForecastSettingsWithFeedback -Root $Root -Settings $settings; Wait-ForecastKey; continue
         }
         $current = if ($index -ge 0) { $items[$index] } else { [pscustomobject]@{ id = ''; type = 'Purchase'; description = ''; startMonth = ''; endMonth = ''; recurrence = 'OneTime'; amount = ''; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = '' } }
-        $type = Read-ForecastChoice -Prompt 'Type: PURCHASE, RENEWAL, or BUSINESSCHANGE' -Valid @('PURCHASE', 'RENEWAL', 'BUSINESSCHANGE') -Default ([string]$current.type).ToUpperInvariant()
-        $recurrence = Read-ForecastChoice -Prompt 'Recurrence: ONETIME, MONTHLY, or ANNUAL' -Valid @('ONETIME', 'MONTHLY', 'ANNUAL') -Default ([string]$current.recurrence).ToUpperInvariant()
-        $treatment = Read-ForecastChoice -Prompt 'Treatment: ADDITIVE, ALREADYINBASELINE, or REPLACESBASELINEAMOUNT' -Valid @('ADDITIVE', 'ALREADYINBASELINE', 'REPLACESBASELINEAMOUNT') -Default ([string]$current.baselineTreatment).ToUpperInvariant()
-        $new = [pscustomobject]@{
-            id = Read-ForecastText -Prompt 'Unique ID' -Default $current.id
-            type = switch ($type) { 'RENEWAL' { 'Renewal' } 'BUSINESSCHANGE' { 'BusinessChange' } default { 'Purchase' } }
-            description = ConvertTo-ForecastSafeText (Read-ForecastText -Prompt 'Description' -Default $current.description) 200
-            startMonth = Read-ForecastText -Prompt 'Start month (yyyy-MM)' -Default $current.startMonth
-            endMonth = Read-ForecastText -Prompt 'End month (yyyy-MM, blank for open-ended)' -Default $current.endMonth
-            recurrence = switch ($recurrence) { 'MONTHLY' { 'Monthly' } 'ANNUAL' { 'Annual' } default { 'OneTime' } }
-            amount = Read-ForecastText -Prompt 'Amount per occurrence (negative for a reduction)' -Default $current.amount
-            baselineTreatment = switch ($treatment) { 'ALREADYINBASELINE' { 'AlreadyInBaseline' } 'REPLACESBASELINEAMOUNT' { 'ReplacesBaselineAmount' } default { 'Additive' } }
-            replacedAmount = ''
-            commitmentId = (Read-ForecastText -Prompt 'Commitment ID it covers (optional)' -Default $current.commitmentId).Trim().ToLowerInvariant()
+        $type = Read-ForecastChoice -Prompt 'Type: PURCHASE, RENEWAL, BUSINESSCHANGE, or EXTERNALACTUAL' -Valid @('PURCHASE', 'RENEWAL', 'BUSINESSCHANGE', 'EXTERNALACTUAL') -Default ([string]$current.type).ToUpperInvariant()
+        if ($type -eq 'EXTERNALACTUAL') {
+            # One month's cost already billed; it adds to that month's actuals, so it has no recurrence, treatment, or commitment.
+            Write-FinOpsConsole '  Cost already billed that the data doesn''t include, such as EA charges before a move to MCA. It''s added to that month''s actuals and never changes growth.' -ForegroundColor DarkGray
+            $new = [pscustomobject]@{
+                id = Read-ForecastText -Prompt 'Unique ID' -Default $current.id
+                type = 'ExternalActual'
+                description = ConvertTo-ForecastSafeText (Read-ForecastText -Prompt 'Description (where the amount comes from, such as an invoice)' -Default $current.description) 200
+                startMonth = Read-ForecastText -Prompt 'Month it was billed (yyyy-MM)' -Default $current.startMonth
+                endMonth = ''
+                recurrence = 'OneTime'
+                amount = Read-ForecastText -Prompt 'Amount billed' -Default $current.amount
+                baselineTreatment = 'Additive'
+                replacedAmount = ''
+                commitmentId = ''
+            }
         }
-        if ($new.baselineTreatment -eq 'ReplacesBaselineAmount') { $new.replacedAmount = Read-ForecastText -Prompt 'Amount of the baseline it replaces, per occurrence' -Default $current.replacedAmount }
-        $others = if ($index -ge 0) { @($items | Select-Object -Index @(0..($items.Count - 1) | Where-Object { $_ -ne $index })) } else { $items }
+        else {
+            $recurrence = Read-ForecastChoice -Prompt 'Recurrence: ONETIME, MONTHLY, or ANNUAL' -Valid @('ONETIME', 'MONTHLY', 'ANNUAL') -Default ([string]$current.recurrence).ToUpperInvariant()
+            $treatment = Read-ForecastChoice -Prompt 'Treatment: ADDITIVE, ALREADYINBASELINE, or REPLACESBASELINEAMOUNT' -Valid @('ADDITIVE', 'ALREADYINBASELINE', 'REPLACESBASELINEAMOUNT') -Default ([string]$current.baselineTreatment).ToUpperInvariant()
+            $new = [pscustomobject]@{
+                id = Read-ForecastText -Prompt 'Unique ID' -Default $current.id
+                type = switch ($type) { 'RENEWAL' { 'Renewal' } 'BUSINESSCHANGE' { 'BusinessChange' } default { 'Purchase' } }
+                description = ConvertTo-ForecastSafeText (Read-ForecastText -Prompt 'Description' -Default $current.description) 200
+                startMonth = Read-ForecastText -Prompt 'Start month (yyyy-MM)' -Default $current.startMonth
+                endMonth = Read-ForecastText -Prompt 'End month (yyyy-MM, blank for open-ended)' -Default $current.endMonth
+                recurrence = switch ($recurrence) { 'MONTHLY' { 'Monthly' } 'ANNUAL' { 'Annual' } default { 'OneTime' } }
+                amount = Read-ForecastText -Prompt 'Amount per occurrence (negative for a reduction)' -Default $current.amount
+                baselineTreatment = switch ($treatment) { 'ALREADYINBASELINE' { 'AlreadyInBaseline' } 'REPLACESBASELINEAMOUNT' { 'ReplacesBaselineAmount' } default { 'Additive' } }
+                replacedAmount = ''
+                commitmentId = (Read-ForecastText -Prompt 'Commitment ID it covers (optional)' -Default $current.commitmentId).Trim().ToLowerInvariant()
+            }
+            if ($new.baselineTreatment -eq 'ReplacesBaselineAmount') { $new.replacedAmount = Read-ForecastText -Prompt 'Amount of the baseline it replaces, per occurrence' -Default $current.replacedAmount }
+        }
+        # Wrapped, so one existing item stays a list rather than a single object.
+        $others = @(if ($index -ge 0) { $items | Select-Object -Index @(0..($items.Count - 1) | Where-Object { $_ -ne $index }) } else { $items })
         $check = Test-ForecastScheduledItems -Items @($others + $new)
         $problems = @($check.Issues | Where-Object { $_.Subject -eq $new.id -or $_.Code -eq 'SCH-DUPLICATE' })
         if ($problems.Count) { foreach ($p in $problems) { Write-FinOpsConsole "  ! $($p.Message)" -ForegroundColor Yellow }; Wait-ForecastKey; continue }
         $settings.scheduledItems = if ($index -ge 0) { @(for ($position = 0; $position -lt $items.Count; $position++) { if ($position -eq $index) { $new } else { $items[$position] } }) } else { @($items + $new) }
-        Save-ForecastSettingsWithFeedback -Root $Root -Settings $settings; Wait-ForecastKey
+        Save-ForecastSettingsWithFeedback -Root $Root -Settings $settings
+        Write-ForecastScheduleEffect -Id ([string]$new.id) -View (Get-ForecastScheduleView -Settings $settings -Session $Session)
+        Wait-ForecastKey
     }
 }
 

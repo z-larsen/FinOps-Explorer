@@ -65,6 +65,17 @@ Describe 'Forecast end to end' {
         @(Read-ReportCsv $script:Result.ReportDirectory 'forecast-reconciliation.csv' | Where-Object { [decimal]$_.Difference -ne 0 }).Count | Should -Be 0
     }
 
+    It 'Explains scheduled items and reviews in the report, and adds their columns to the CSVs' {
+        $html = Get-Content -LiteralPath (Join-Path $script:Result.ReportDirectory 'forecast-report.html') -Raw
+        $html | Should -Match 'id="scheduled-heading"'
+        $html | Should -Match 'No scheduled items were added, so FY2027 has none\.'
+        $html | Should -Match 'A review is a question the data can.t answer on its own'
+        $html | Should -Not -MatchExactly 'Added by hand' -Because 'nothing was added by hand, so there is no column for it'
+        Get-Content -LiteralPath (Join-Path $script:Result.ReportDirectory 'forecast-scheduled-items.csv') -TotalCount 1 | Should -Be '"Id","Type","Month","Amount","Replaced","Net","Treatment","Counted","Status"'
+        Get-Content -LiteralPath (Join-Path $script:Result.ReportDirectory 'forecast-monthly.csv') -TotalCount 1 | Should -Match ',"Note","AddedActual"$'
+        (Read-ReportCsv $script:Result.ReportDirectory 'forecast-fiscal-year.csv').AddedActual | Should -Be '0'
+    }
+
     It 'Escapes untrusted text in CSV and HTML' {
         $workloads = @(Read-ReportCsv $script:Result.ReportDirectory 'workloads.csv')
         $workloads.Count | Should -Be 4

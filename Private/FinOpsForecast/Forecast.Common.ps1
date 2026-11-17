@@ -163,6 +163,18 @@ function Get-ForecastMonthDifference {
     return (($b.Year - $a.Year) * 12) + ($b.Month - $a.Month)
 }
 
+function Join-ForecastMonthList {
+    # "2026-08", "2026-07 and 2026-08", "2026-07, 2026-09, and 2026-11", or
+    # "2026-07 to 2026-10" for three or more months in a row.
+    param([AllowEmptyCollection()][string[]]$Months)
+    $sorted = @($Months | Where-Object { $_ } | Sort-Object -Unique)
+    if ($sorted.Count -le 1) { return [string]($sorted -join '') }
+    if ($sorted.Count -eq 2) { return "$($sorted[0]) and $($sorted[1])" }
+    $inRow = (Get-ForecastMonthDifference -First $sorted[0] -Second $sorted[-1]) -eq $sorted.Count - 1
+    if ($inRow) { return "$($sorted[0]) to $($sorted[-1])" }
+    return "$(($sorted | Select-Object -SkipLast 1) -join ', '), and $($sorted[-1])"
+}
+
 function ConvertFrom-ForecastDate {
     # Parses an export or manifest date as UTC. Returns $null when unreadable.
     param([AllowNull()]$Value)

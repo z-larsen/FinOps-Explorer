@@ -462,7 +462,9 @@ function Show-ForecastHowItWorks {
     if ($settings.scope.label) { Write-FinOpsConsole "  Forecasting: $(ConvertTo-ForecastSafeText ([string]$settings.scope.label) 120)" -ForegroundColor Cyan }
     Write-FinOpsConsole ''
     Write-ForecastHowItWorks -Settings $settings -SubscriptionCount $ids.Count -EarliestMonth (Get-ForecastFirstNeededMonth -Settings $settings -AsOf $AsOf) -AsOf $AsOf -BillingCheck $billingCheck -InUse (Get-ForecastReadApproach -Settings $settings) -Sources @($settings.sources)
-    Wait-ForecastKey
+    Write-FinOpsConsole ''
+    Write-FinOpsConsole '  S How scheduled items and reviews work   B Back' -ForegroundColor DarkGray
+    if ((Read-ForecastChoice -Prompt 'Choose' -Valid @('S', 'B') -Default 'B') -eq 'S') { Show-ForecastScheduleHelp -Topic Scheduled }
 }
 
 function Start-ForecastGuidedSetup {

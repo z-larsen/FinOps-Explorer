@@ -83,12 +83,12 @@ Everything happens on one page. Each line shows a status: **OK**, **CHECK** (a w
 | 1 Source | Export locations (discover in Azure, enter a storage path, or a local folder), live Cost Details reports, the EA-to-MCA migration date, or a switch to manual inputs. **U** removes live sources Cost Details can't read and records why each subscription is left out |
 | 2 Scope | Selected subscriptions, or an MCA billing profile (its EA history before the migration is included for the same subscriptions) |
 | 3 Period | Fiscal-year start month, current or next fiscal year, lookback length, finalization grace days, stale-data age |
-| 4 Assumptions | Growth method settings, whether a change across a change of agreement needs a review, Marketplace and tax filters, whether Marketplace charges get their own report section, workload mode and mapping, scheduled purchases, renewals, and business changes |
-| 5 Exceptions | Everything that needs a human decision |
+| 4 Assumptions | Growth method settings, whether a change across a change of agreement needs a review, Marketplace and tax filters, whether Marketplace charges get their own report section, workload mode and mapping, and scheduled items: purchases, renewals, business changes, and cost already billed that the data doesn't include. **H** in scheduled items explains them |
+| 5 Exceptions | Everything that needs a human decision. **H** explains how reviews work |
 | 6 Reconciliation | Each month's raw export total against what was included and excluded |
 | 7 Refresh | Refresh history; refresh now |
 
-Other keys: **R** refresh, **W** workloads, **F** forecast and save, **P** preview report, **I** manual inputs, **G** guided setup, **H** how the forecast works and how long reading takes, **Q** quit.
+Other keys: **R** refresh, **W** workloads, **F** forecast and save, **P** preview report, **I** manual inputs, **G** guided setup, **H** how the forecast works and how long reading takes (then **S** for how scheduled items and reviews work), **Q** quit.
 
 After guided setup, a typical first run is:
 
@@ -130,7 +130,7 @@ When nobody has set up exports, or you can't reach the files, a **Cost Details**
 
 ## Review decisions
 
-The forecast doesn't guess when the data is ambiguous. It asks, records your answer with a reason, and asks again if the underlying data changes later.
+The forecast doesn't guess when the data is ambiguous. It asks, records your answer with a reason, and asks again if the underlying data changes later. A **REQUIRED** review must be decided before the forecast is Ready; until then, the numbers stay as they are. Press **H** in **5 Exceptions** for a short explanation in the tool, and the report's **Exceptions and reviews** tab explains the same for readers who don't use it.
 
 Manual-month approvals include the billing currency. Changing it reopens every
 month for review; existing approvals saved before this check also need to be
@@ -146,18 +146,39 @@ confirmed once. No currency conversion is performed.
 | Unclassified publisher | Treat rows from non-Microsoft publishers as Marketplace or Microsoft. EA exports label every row `Azure`, so this comes up for EA. The decision covers the publisher names it lists; new rows from those publishers keep it, and a new publisher reopens it. |
 | Overlapping export scopes | Pick which export to keep when two carry the same subscription and month. Charges without a subscription, such as a shared savings plan purchase, follow the same choice by billing profile. |
 | Recurring purchase not scheduled | Press **A** on the review to add the proposed scheduled item: the latest month's amount, monthly from the next month, for the same commitment, with no end month. The review names the subscription that pays for it. Then set an end month if the commitment ends sooner. Or confirm it won't recur. |
+| Possible renewal of an up-front purchase | A commitment paid once, up front, in the last 12 complete months, that would bill again in a fiscal-year month still to come if its term is one year and it renews. Cost data doesn't show the term, so check it in the Azure portal under **Reservations** or **Savings plans**, along with the renewal setting. Then press **A** to add the proposed yearly item from the purchase's anniversary, or choose **NotRenewing** with a reason, such as a three-year term. |
 | Legacy export file without a manifest | Approve only if you've confirmed it's the complete actual-cost export for the month. Its rows must reach the month's last day even when its folder name describes a whole month. Matching filenames in different sources are reviewed separately. |
 | Positive refund rows, unknown charge types, boundary exclusions | Acknowledge after checking. |
 
 ## Scheduled items
 
-Purchases and refunds aren't grown with the run rate, so future commitments come only from scheduled items. In actual cost, a reservation or savings plan paid up front shows once, in the month it's bought; one paid monthly shows the same charge every month on the purchase anniversary. To list the monthly ones, filter Cost analysis to **Charge type** Purchase and **Frequency** Recurring, then add each as a monthly scheduled item. The forecast finds them too: a commitment billed in each of the last three complete months, or marked recurring, gets a review that proposes the item, so **A** adds it. Each scheduled item has a unique ID, a start month, and a recurrence (one-time, monthly, or annual). It also has a treatment:
+The forecast grows usage from the trend in the history. Some costs don't follow that trend, so you add them by hand in **4 Assumptions**, **S**. Press **H** there for a short explanation in the tool.
+
+Purchases and refunds aren't grown with the run rate, so future commitments come only from scheduled items. In actual cost, a reservation or savings plan paid up front shows once, in the month it's bought; one paid monthly shows the same charge every month on the purchase anniversary. To list the monthly ones, filter Cost analysis to **Charge type** Purchase and **Frequency** Recurring, then add each as a monthly scheduled item. The forecast finds them too:
+
+- A commitment billed in each of the last three complete months, or marked recurring, gets a review that proposes a monthly item, so **A** adds it.
+- A commitment paid once, up front, in the last 12 complete months, whose anniversary falls in a fiscal-year month still to come, gets a review that proposes a yearly renewal from that anniversary. Renewing creates a new reservation or savings plan when the old one expires, with the same term and billing frequency unless someone changes them. Renewal is on by default for a new reservation and off by default for a savings plan ([reservations](https://learn.microsoft.com/azure/cost-management-billing/reservations/reservation-renew), [savings plans](https://learn.microsoft.com/azure/cost-management-billing/savings-plan/renew-savings-plan)). A commitment billed more than once, or refunded, isn't proposed.
+
+Each scheduled item has a unique ID, a type, a start month, and a recurrence: one-time, monthly, or annual.
+
+| Type | Use it for |
+|---|---|
+| Purchase | A commitment billed on a schedule, such as a reservation paid monthly |
+| Renewal | A commitment you expect to buy again, such as a one-year reservation paid up front |
+| BusinessChange | A planned change in cost, such as a migration. A negative amount is a reduction |
+| ExternalActual | Cost already billed that the data doesn't include, such as EA charges before a move to MCA |
+
+A purchase, renewal, or business change counts only in months that haven't ended, because actual cost already shows what was billed. It also has a treatment:
 
 - **Additive**: adds the amount.
 - **AlreadyInBaseline**: adds nothing, because the run rate already includes it.
 - **ReplacesBaselineAmount**: adds the amount minus the part of the baseline it replaces.
 
-If an item covers an existing reservation or savings plan, give its commitment ID (the order ID or the full resource ID). Then, when that purchase has already posted in the current month, the item isn't added on top of the month-to-date actuals; the monthly CSV shows it under `ScheduledAlreadyPosted`. A refund for the same commitment does not mean the purchase has posted. A Purchase or Renewal item without a commitment ID gets a note in any current month where purchases have already posted, so you can check it isn't counted twice.
+An external actual is one month's cost, added to that month's actuals on its own line. It counts only in a month that has started, and it never feeds growth or the baseline. For example, if an MCA started on July 15 and only MCA data can be read, add the EA charges for July 1 to 14, from the EA invoice, as an external actual for July.
+
+The item list shows what each item adds to the fiscal year. An item that adds nothing, such as a purchase dated in a month that has already ended, shows **no effect**, and the **Unique keys and valid assumptions** check warns about it without blocking Ready. An item with some months that have ended and some still to come counts only the months to come.
+
+If an item covers an existing reservation or savings plan, give its commitment ID (the order ID or the full resource ID). Then, when that purchase has already posted in the current month, the item isn't added on top of the month-to-date actuals; the monthly CSV shows it under `ScheduledAlreadyPosted`. A refund for the same commitment does not mean the purchase has posted. A Purchase or Renewal item without a commitment ID gets a note in any current month where purchases have already posted, so you can check it isn't counted twice. A Renewal item gets the same note even with a commitment ID, since a renewal bills under its new order ID.
 
 ## Workloads
 
@@ -180,9 +201,9 @@ You can rank by change, spend, growth, or largest increase. Every workload is li
 
 **F** and **P** write a new private folder under `FinOpsToolkit\Explorer\Reports` with:
 
-- `forecast-report.html`: the whole forecast, laid out like the scan report. It opens on an **Overview** for executive and finance readers: the status and what needs attention, with links to the details; a chart of the fiscal year by month, with actuals, the central forecast, and the low-to-high range; how the central estimate adds up from actuals, the rest of the year's forecast, and scheduled items; the baseline, growth, history, and cost basis behind it; quarter totals; and the largest workload increases. Each section has its own tab: **Fiscal year by month** (with a totals row), **Monthly history** and **Adjacent-month comparisons** (each with a chart), **Workloads**, **Marketplace** (Marketplace charges by month and by subscription, when there are any), **Checks** (with every source's read status), **Exceptions and reviews**, **Backtest**, **Reconciliation** (every included and excluded amount), and **Method and disclosure**. Tables can be filtered, sorted, paged, resized, and expanded, and printing shows every tab. The page is self-contained and loads nothing from the network.
+- `forecast-report.html`: the whole forecast, laid out like the scan report. It opens on an **Overview** for executive and finance readers: the status and what needs attention, with links to the details; a chart of the fiscal year by month, with actuals, the central forecast, and the low-to-high range; how the central estimate adds up from actuals, the rest of the year's forecast, and scheduled items; the baseline, growth, history, and cost basis behind it; quarter totals; and the largest workload increases. Each section has its own tab: **Fiscal year by month** (with a totals row, then each scheduled item, what it adds, and why any of it doesn't count), **Monthly history** and **Adjacent-month comparisons** (each with a chart), **Workloads**, **Marketplace** (Marketplace charges by month and by subscription, when there are any), **Checks** (with every source's read status), **Exceptions and reviews** (with a short explanation of how reviews work), **Backtest**, **Reconciliation** (every included and excluded amount), and **Method and disclosure**. Actual cost added by hand gets its own line and column wherever there is some. Tables can be filtered, sorted, paged, resized, and expanded, and printing shows every tab. The page is self-contained and loads nothing from the network.
 - `forecast-summary.txt`: headline numbers, the sources read, checks, and the method.
-- CSVs for the fiscal-year months, history, comparisons, checks, reviews, reconciliation, provenance (which export run fed each month), workloads, purchases, and the backtest.
+- CSVs for the fiscal-year months, history, comparisons, checks, reviews, reconciliation, provenance (which export run fed each month), workloads, purchases, and the backtest. `forecast-scheduled-items.csv` has one row for each month a scheduled item falls in, with whether it counted and why not (`PastMonth`, `AlreadyPosted`, or `NotStarted`). `forecast-monthly.csv` and `forecast-fiscal-year.csv` end with `AddedActual`, the actual cost added by hand.
 - `read-status.csv`: one row for each source, with what its reads returned: **Rows**, **No rows**, **Partly read**, **Unsupported offer**, **Access denied**, **Failed**, or **Not attempted**. Then one row for each subscription left out of the scope, with its reason. Rows, the included amount, and each source's first and last charge come from the runs the forecast uses, so a superseded export run doesn't count; the dates are from the source's latest complete month, with a note when its charges start late or end early.
 - `marketplace.csv`: Marketplace charges in the scope by month, subscription, and charge type, and whether they're counted. They aren't counted by default; they're listed for tracking commitments such as an Azure consumption commitment. Amounts in different billing currencies are kept and totaled apart. Turn the section and file off in **4 Assumptions**, **F** (on by default).
 
@@ -203,7 +224,7 @@ It refreshes, writes reports, and saves a vintage if the forecast is Ready. If i
 - **Central estimate** uses the median month-over-month change in run rate. With an even number of changes, that's the average of the middle two.
 - **Sensitivity range** uses the 25th to 75th percentile of historical changes, interpolated linearly between them like Excel's PERCENTILE.INC. Under 12 months of history it uses the lowest to the highest change instead. It shows how much the history varied. It is **not** a confidence interval.
 - **Custom percentiles** must satisfy `0 <= low < 50 < high <= 100`, so the range brackets the central median. This is checked for JSON settings as well as console edits.
-- **Fiscal-year totals** add completed months, this month's actuals so far plus the rest of the month, the remaining forecast months, and scheduled items. Low and high each follow one growth path for the whole year.
+- **Fiscal-year totals** add completed months, this month's actuals so far plus the rest of the month, the remaining forecast months, scheduled items, and any actual cost added by hand. Low and high each follow one growth path for the whole year.
 - **Month-to-date coverage** comes from the verified run range, bounded by when the run was submitted. Days with no charges aren't forecast again. If selected runs have different coverage cutoffs, Ready is blocked until a refresh brings them into line.
 - **Partial population** means a subscription in scope is missing data in some months. **Stale data** means the last refresh failed or the newest data is old. Both appear on every output.
 - **Source check details** show one line for each failing scope, with the other months it fails in, and count the issues past the first five scopes.

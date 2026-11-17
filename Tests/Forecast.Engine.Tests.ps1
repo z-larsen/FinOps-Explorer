@@ -374,6 +374,112 @@ Describe 'Forecast engine' {
             @($model.Schedule.Issues | Where-Object Code -EQ 'SCH-DUPLICATE').Count | Should -Be 1
             @($model.Reviews | Where-Object Category -EQ 'Schedule').Count | Should -Be 1
         }
+
+        It 'Counts a scheduled item only in months that haven''t ended, and warns when it changes nothing' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))
+            $settings = New-TestSettings -StartMonth 1
+            $item = @{ description = 'synthetic'; endMonth = ''; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = '' }
+            $settings.scheduledItems = @(
+                [pscustomobject](@{ id = 'misdated'; type = 'BusinessChange'; startMonth = '2026-08'; recurrence = 'OneTime'; amount = '100' } + $item)
+                [pscustomobject](@{ id = 'next-year'; type = 'Purchase'; startMonth = '2027-03'; recurrence = 'OneTime'; amount = '100' } + $item)
+                [pscustomobject](@{ id = 'monthly'; type = 'Purchase'; startMonth = '2026-09'; recurrence = 'Monthly'; amount = '10' } + $item)
+            )
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $model.Projection.Scheduled | Should -Be 20 -Because 'only November and December are still to come'
+            (@($model.ScheduleSummary) | ForEach-Object { "$($_.Id)=$($_.Status)" }) -join ', ' | Should -Be 'misdated=No effect, next-year=No effect, monthly=Partly counted'
+            (@($model.ScheduleEffects | Where-Object { $_.Id -eq 'monthly' -and -not $_.Counted }) | ForEach-Object { "$($_.Month) $($_.Status)" }) -join ', ' | Should -Be '2026-09 PastMonth, 2026-10 PastMonth'
+            $warnings = @($model.Issues | Where-Object Code -EQ 'SCH-NOEFFECT')
+            $warnings.Severity | Should -Be @('Warn', 'Warn')
+            $warnings[0].Message | Should -Be 'Scheduled item misdated changes nothing in FY2026: 2026-08 has already ended, so only actual cost counts there. To add cost that''s already billed but isn''t in the data, make it an external actual.'
+            $warnings[1].Message | Should -Be 'Scheduled item next-year changes nothing in FY2026: it has no occurrence from 2026-01 to 2026-12.'
+            $keys = InModuleScope FinOpsForecast -Parameters @{ Dataset = $dataset; Model = $model; Settings = $settings; AsOf = $script:AsOf } {
+                @((Test-ForecastReadiness -Dataset $Dataset -Model $Model -Settings $Settings -AsOf $AsOf).Checks | Where-Object Id -EQ 'KEYS')[0]
+            }
+            $keys.Status | Should -Be 'Warn' -Because 'the forecast is still right without the item'
+            $keys.Detail | Should -Match '^Scheduled item misdated changes nothing'
+        }
+
+        It 'Adds an external actual to its month''s actuals, never to growth' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]](1000, 1020, 1040, 1061, 1082, 1104, 1126, 1149, 1172, 1195, 1219, 1243)))
+            $settings = New-TestSettings -StartMonth 1
+            $before = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $item = @{ type = 'ExternalActual'; endMonth = ''; recurrence = 'OneTime'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = '' }
+            $settings.scheduledItems = @(
+                [pscustomobject](@{ id = 'ea-july'; description = 'EA charges before the move'; startMonth = '2026-07'; amount = '500' } + $item)
+                [pscustomobject](@{ id = 'too-soon'; description = 'Not billed yet'; startMonth = '2026-12'; amount = '70' } + $item)
+            )
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $july = @($model.Projection.Rows | Where-Object Month -EQ '2026-07')[0]
+            $july.AddedActual | Should -Be 500
+            $july.TotalCentral | Should -Be ($july.Actual + 500)
+            $model.Projection.AddedActual | Should -Be 500
+            $model.Projection.ActualToDate | Should -Be $before.Projection.ActualToDate
+            $model.Projection.Scheduled | Should -Be 0
+            foreach ($path in 'TotalLow', 'TotalCentral', 'TotalHigh') { $model.Projection.$path | Should -Be ($before.Projection.$path + 500) -Because $path }
+            $model.Growth.Central | Should -Be $before.Growth.Central
+            $model.Baseline.Value | Should -Be $before.Baseline.Value
+            @($model.Issues | Where-Object Code -EQ 'SCH-NOEFFECT').Message | Should -Be 'Scheduled item too-soon changes nothing in FY2026: 2026-12 hasn''t started, and an external actual adds only to a month that has.'
+            $settings.scheduledItems = @([pscustomobject](@{ id = 'every-month'; description = 'synthetic'; startMonth = '2026-07'; amount = '500' } + $item))
+            $settings.scheduledItems[0].recurrence = 'Monthly'
+            $settings.scheduledItems[0].baselineTreatment = 'AlreadyInBaseline'
+            @((Invoke-TestModel -Dataset $dataset -Settings $settings).Schedule.Issues | Where-Object Code -EQ 'SCH-INVALID').Message |
+                Should -Be 'Scheduled item every-month: an external actual is one month''s cost, so its recurrence must be OneTime; an external actual adds to that month''s actuals, so its treatment must be Additive.'
+        }
+
+        It 'Proposes an annual renewal for an up-front purchase that would bill again within the fiscal year' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))
+            $dataset.SubscriptionNames = @{ 'sub-synth-1' = 'sub-synth-one' }
+            $cell = { param($Month, $Commitment, $Cost, $Frequency = 'OneTime', $ChargeType = 'Purchase') [pscustomobject]@{ Month = $Month; Stream = 'Purchase'; ChargeType = $ChargeType; CommitmentId = $Commitment; Frequency = $Frequency; PricingModel = 'Reservation'; SubscriptionId = 'sub-synth-1'; Cost = [decimal]$Cost } }
+            $dataset.Cells = @(
+                & $cell '2025-12' 'ri-upfront' 1200
+                # None of these would bill again in FY2026: a later anniversary, a refund, a monthly charge, a second charge, a purchase before the window, and one already scheduled.
+                & $cell '2026-02' 'ri-later' 900
+                & $cell '2025-11' 'ri-refunded' 400; & $cell '2026-01' 'ri-refunded' -400 'OneTime' 'Refund'
+                & $cell '2025-12' 'ri-monthly' 50 'Recurring'
+                & $cell '2025-11' 'ri-twice' 80; & $cell '2025-12' 'ri-twice' 80
+                & $cell '2025-10' 'ri-old' 60
+                & $cell '2025-12' 'ri-scheduled' 300
+            )
+            $settings = New-TestSettings -StartMonth 1
+            $settings.scheduledItems = @([pscustomobject]@{ id = 'covered'; type = 'Renewal'; description = 'synthetic'; startMonth = '2026-12'; endMonth = ''; recurrence = 'Annual'; amount = '300'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = 'ri-scheduled' })
+            $model = Invoke-TestModel -Dataset $dataset -Settings $settings
+            $reviews = @($model.Reviews | Where-Object Category -EQ 'RenewalPurchase')
+            $reviews.Count | Should -Be 1
+            $reviews[0].Required | Should -BeTrue
+            $reviews[0].Decision | Should -Be 'Pending'
+            @($reviews[0].Options) -join ',' | Should -Be 'Scheduled,NotRenewing'
+            $reviews[0].Detail | Should -Match '^Commitment ri-upfront was billed 1,200\.00 once, up front, in 2025-12 by sub-synth-one\. If its term is one year and it renews, it bills again in 2026-12, within FY2026\. Cost data doesn''t show the term, so check it under Reservations in the Azure portal'
+            $proposal = $reviews[0].Proposal
+            $proposal.id | Should -Match '^renewal-[0-9a-f]{8}$'
+            "$($proposal.type) $($proposal.recurrence) $($proposal.startMonth) $($proposal.amount) $($proposal.baselineTreatment) $($proposal.commitmentId) [$($proposal.endMonth)]" | Should -Be 'Renewal Annual 2026-12 1200 Additive ri-upfront []'
+            $proposal.description | Should -Be 'Possible renewal of an up-front purchase, paid by sub-synth-one'
+            $model.Projection.Scheduled | Should -Be 300 -Because 'a pending proposal changes nothing'
+            $settings.scheduledItems = @($settings.scheduledItems) + $proposal
+            $added = Invoke-TestModel -Dataset $dataset -Settings $settings
+            @($added.Reviews | Where-Object Category -EQ 'RenewalPurchase').Count | Should -Be 0
+            @($added.Projection.Rows | Where-Object Month -EQ '2026-12')[0].Scheduled | Should -Be 1500
+            # Forecasting next year, the first anniversary comes before it and the second falls in it.
+            $settings.scheduledItems = @($settings.scheduledItems[0])
+            $settings.period.fiscalYearOffset = 1
+            $next = @((Invoke-TestModel -Dataset $dataset -Settings $settings).Reviews | Where-Object Category -EQ 'RenewalPurchase')
+            ($next.Subject | Sort-Object) -join ', ' | Should -Be 'ri-later, ri-upfront' -Because 'the purchase from February 2026 would bill again in February 2027'
+            $upfront = @($next | Where-Object Subject -EQ 'ri-upfront')[0]
+            $upfront.Detail | Should -Match 'it bills again in 2026-12, and each year after, including 2027-12, within FY2027\.'
+            $upfront.Proposal.startMonth | Should -Be '2026-12'
+        }
+
+        It 'Notes a renewal that may have posted under a new order ID this month' {
+            $dataset = New-TestDataset -Values (New-RateSeries ([decimal[]]@(1..12 | ForEach-Object { 3000 })))
+            $month = (New-TestDataset -Values ([ordered]@{ '2026-11' = 900 })).Months[0]
+            $month.Status = 'Provisional'; $month.DataThrough = [datetime]'2026-11-04'
+            $dataset.Months += $month
+            $dataset.Cells = @([pscustomobject]@{ Month = '2026-11'; Stream = 'Purchase'; ChargeType = 'Purchase'; CommitmentId = 'ri-new-order'; Cost = 500d })
+            $settings = New-TestSettings -StartMonth 1
+            $settings.scheduledItems = @([pscustomobject]@{ id = 'renewal-synth'; type = 'Renewal'; description = 'synthetic'; startMonth = '2026-11'; endMonth = ''; recurrence = 'Annual'; amount = '500'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = 'ri-old-order' })
+            $november = @((Invoke-TestModel -Dataset $dataset -Settings $settings).Projection.Rows | Where-Object Month -EQ '2026-11')[0]
+            $november.Scheduled | Should -Be 500
+            $november.Note | Should -Match 'renewal item\(s\) renewal-synth may have posted under a new order ID, so check they aren''t already in the actuals\.'
+        }
     }
 
     Context 'Backtest' {

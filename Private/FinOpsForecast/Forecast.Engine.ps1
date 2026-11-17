@@ -367,13 +367,15 @@ function Test-ForecastScheduledItems {
         if ($ids.ContainsKey($id)) { $ids[$id]++; continue }
         $ids[$id] = 1
         $problems = @()
-        if ($item.type -notin 'Purchase', 'Renewal', 'BusinessChange') { $problems += 'type must be Purchase, Renewal, or BusinessChange' }
+        if ($item.type -notin 'Purchase', 'Renewal', 'BusinessChange', 'ExternalActual') { $problems += 'type must be Purchase, Renewal, BusinessChange, or ExternalActual' }
         if (-not (Test-ForecastMonthKey -MonthKey ([string]$item.startMonth))) { $problems += 'start month must be yyyy-MM' }
         if ($item.endMonth -and -not (Test-ForecastMonthKey -MonthKey ([string]$item.endMonth))) { $problems += 'end month must be yyyy-MM' }
         elseif ($item.endMonth -and (Test-ForecastMonthKey ([string]$item.startMonth)) -and [string]::CompareOrdinal([string]$item.endMonth, [string]$item.startMonth) -lt 0) { $problems += 'end month is before the start month' }
         if ($item.recurrence -notin 'OneTime', 'Monthly', 'Annual') { $problems += 'recurrence must be OneTime, Monthly, or Annual' }
+        elseif ($item.type -eq 'ExternalActual' -and $item.recurrence -ne 'OneTime') { $problems += 'an external actual is one month''s cost, so its recurrence must be OneTime' }
         if ($null -eq (Read-ForecastDecimal -Value $item.amount)) { $problems += 'amount must be a number' }
         if ($item.baselineTreatment -notin 'Additive', 'AlreadyInBaseline', 'ReplacesBaselineAmount') { $problems += 'baseline treatment must be Additive, AlreadyInBaseline, or ReplacesBaselineAmount' }
+        elseif ($item.type -eq 'ExternalActual' -and $item.baselineTreatment -ne 'Additive') { $problems += 'an external actual adds to that month''s actuals, so its treatment must be Additive' }
         if ($item.baselineTreatment -eq 'ReplacesBaselineAmount' -and $null -eq (Read-ForecastDecimal -Value $item.replacedAmount)) { $problems += 'a replaced amount is required' }
         if ($problems.Count) { $issues.Add((New-ForecastIssue -Code 'SCH-INVALID' -Message "Scheduled item ${label}: $($problems -join '; ')." -Subject $label)); continue }
         $valid.Add($item)
@@ -436,6 +438,84 @@ function Test-ForecastCommitmentMatch {
     return ($a -eq $b) -or $b.EndsWith("/$a", [StringComparison]::Ordinal) -or $a.EndsWith("/$b", [StringComparison]::Ordinal)
 }
 
+function Get-ForecastRenewalReviews {
+    # Up-front purchases from the last 12 complete months that would bill
+    # again in a fiscal-year month still to come, if their term is one year
+    # and they renew. Cost data doesn't carry the term, so each one asks,
+    # and proposes an annual item from the purchase's anniversary. A
+    # commitment billed more than once, refunded, or already covered by a
+    # scheduled item is left out.
+    param(
+        [Parameter(Mandatory)]$Dataset,
+        [Parameter(Mandatory)]$Settings,
+        [Parameter(Mandatory)]$Window,
+        [Parameter(Mandatory)]$FiscalYear,
+        [Collections.IDictionary]$Reviews,
+        [string]$ScopeKey = ''
+    )
+    $last = [string]$Window.Last
+    if (-not (Test-ForecastMonthKey -MonthKey $last)) { return , @() }
+    $first = Add-ForecastMonth -MonthKey $last -Count -11
+    $commitments = @{}
+    foreach ($cell in @($Dataset.Cells)) {
+        if (-not $cell -or $cell.Stream -ne 'Purchase' -or -not $cell.CommitmentId) { continue }
+        $key = [string]$cell.CommitmentId
+        if (-not $commitments.ContainsKey($key)) { $commitments[$key] = [pscustomobject]@{ Months = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Cost = 0d; OneTime = $false; Other = $false; Refunded = $false; Payers = @{}; Pricing = '' } }
+        $entry = $commitments[$key]
+        if ($cell.ChargeType -eq 'Refund') { $entry.Refunded = $true; continue }
+        if ($cell.ChargeType -ne 'Purchase') { continue }
+        [void]$entry.Months.Add([string]$cell.Month)
+        if ([string]$cell.Frequency -match '^(?i)one-?time$') { $entry.OneTime = $true } else { $entry.Other = $true }
+        $entry.Cost += [decimal]$cell.Cost
+        $payer = [string]$cell.SubscriptionId
+        if (-not $entry.Payers.ContainsKey($payer)) { $entry.Payers[$payer] = 0d }
+        $entry.Payers[$payer] += [decimal]$cell.Cost
+        if (-not $entry.Pricing) { $entry.Pricing = [string]$cell.PricingModel }
+    }
+    $scheduledItems = @($Settings.scheduledItems | Where-Object { $_ })
+    $scheduledText = (@($scheduledItems | ForEach-Object { "$($_.id) $($_.commitmentId) $($_.description)" }) -join ' ').ToLowerInvariant()
+    $takenIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $scheduledItems) { [void]$takenIds.Add([string]$item.id) }
+    $coming = @($FiscalYear.Months | Where-Object { [string]::CompareOrdinal([string]$_, $last) -gt 0 })
+    $names = if ($Dataset.SubscriptionNames) { $Dataset.SubscriptionNames } else { @{} }
+    $reviewItems = [Collections.Generic.List[object]]::new()
+    foreach ($entry in ($commitments.GetEnumerator() | Sort-Object { [string]$_.Key })) {
+        $value = $entry.Value
+        if (-not $value.OneTime -or $value.Other -or $value.Refunded -or $value.Months.Count -ne 1 -or $value.Cost -le 0) { continue }
+        $purchased = @($value.Months)[0]
+        if ([string]::CompareOrdinal($purchased, $first) -lt 0 -or [string]::CompareOrdinal($purchased, $last) -gt 0) { continue }
+        $anniversary = Add-ForecastMonth -MonthKey $purchased -Count 12
+        $due = @($coming | Where-Object { [string]::CompareOrdinal([string]$_, $anniversary) -ge 0 -and ((Get-ForecastMonthDifference -First $anniversary -Second $_) % 12) -eq 0 })
+        if (-not $due.Count) { continue }
+        if ($scheduledText.Contains($entry.Key) -or @($scheduledItems | Where-Object { Test-ForecastCommitmentMatch -Scheduled ([string]$_.commitmentId) -Posted $entry.Key }).Count) { continue }
+        $payerId = @($value.Payers.GetEnumerator() | Sort-Object @{ Expression = { [decimal]$_.Value }; Descending = $true }, @{ Expression = { [string]$_.Key } } | Select-Object -First 1 | ForEach-Object Key)[0]
+        $payerName = if ($payerId -and $names[$payerId]) { ConvertTo-ForecastSafeText ([string]$names[$payerId]) 60 } else { '' }
+        $paidBy = if ($payerName) { " by $payerName" } elseif ($payerId) { " by subscription $payerId" } else { '' }
+        $guid = [regex]::Match([string]$entry.Key, '[0-9a-fA-F]{8}(?=-[0-9a-fA-F]{4}-)')
+        $stem = 'renewal-' + $(if ($guid.Success) { $guid.Value.ToLowerInvariant() } else { Get-ForecastHash -Text ([string]$entry.Key) -Length 8 })
+        $id = $stem; $suffix = 2
+        while ($takenIds.Contains($id)) { $id = "$stem-$suffix"; $suffix++ }
+        [void]$takenIds.Add($id)
+        $proposal = [pscustomobject]@{
+            id = $id; type = 'Renewal'; description = "Possible renewal of an up-front purchase$(if ($paidBy) { ", paid$paidBy" })"
+            startMonth = $anniversary; endMonth = ''; recurrence = 'Annual'
+            amount = Format-ForecastDecimal $value.Cost; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = [string]$entry.Key
+        }
+        $check = switch ($value.Pricing) {
+            'Reservation' { 'check it under Reservations in the Azure portal, along with its renewal setting, which is on by default when a reservation is bought' }
+            'SavingsPlan' { 'check it under Savings plans in the Azure portal, along with its renewal setting, which is off by default' }
+            default { 'check it where it was bought, along with whether it renews automatically' }
+        }
+        $when = if ($due[0] -eq $anniversary) { $anniversary } else { "$anniversary, and each year after, including $($due[0])" }
+        $detail = "Commitment $($entry.Key) was billed $(Format-ForecastAmount $value.Cost) once, up front, in $purchased$paidBy. If its term is one year and it renews, it bills again in $when, within $($FiscalYear.Label). Cost data doesn't show the term, so $check. Purchases aren't grown with the run rate, so a renewal is in the forecast only as a scheduled item. Press A to add the proposed item: $(Format-ForecastAmount $value.Cost) a year from $anniversary, for this commitment. Or choose NotRenewing if the term is longer, it won't renew, or something else will replace it."
+        $review = New-ForecastReviewItem -Key "renewal:${ScopeKey}:$($entry.Key)" -Fingerprint (Get-ForecastHash -Text "$($entry.Key)|$purchased|$(Format-ForecastDecimal $value.Cost)") -Category 'RenewalPurchase' -Reviews $Reviews -Subject $entry.Key `
+            -Title 'Possible renewal of an up-front purchase' -Detail $detail -Options @('Scheduled', 'NotRenewing')
+        $review | Add-Member -NotePropertyName Proposal -NotePropertyValue $proposal
+        $reviewItems.Add($review)
+    }
+    return , $reviewItems.ToArray()
+}
+
 # -- Projection ------------------------------------------------------------
 function Invoke-ForecastProjection {
     param(
@@ -459,14 +539,28 @@ function Invoke-ForecastProjection {
     }
     $paths = [ordered]@{ Low = $Growth.Low; Central = $Growth.Central; High = $Growth.High }
     $rows = [Collections.Generic.List[object]]::new()
+    # Whether each occurrence of a scheduled item counted, and why not, for
+    # the item list, the report, and the check for items that change nothing.
+    $outcomes = [Collections.Generic.List[object]]::new()
+    $record = {
+        param($Effect, [bool]$Counted, [string]$Status)
+        $outcomes.Add([pscustomobject]@{
+                Id = $Effect.Id; Type = $Effect.Type; Month = $Effect.Month; Amount = $Effect.Amount; Replaced = $Effect.Replaced; Net = $Effect.Net
+                Treatment = $Effect.Treatment; CommitmentId = $Effect.CommitmentId; Counted = $Counted; Status = $Status
+            })
+    }
     foreach ($month in $FiscalYear.Months) {
         $days = Get-ForecastDaysInMonth -MonthKey $month
         $data = $byMonth[$month]
         $monthEffects = @($ScheduleEffects | Where-Object Month -EQ $month)
+        # An external actual is cost already billed that the data doesn't
+        # include. It adds to a month that has started, never to growth.
+        $actualEffects = @($monthEffects | Where-Object Type -EQ 'ExternalActual')
+        $plannedEffects = @($monthEffects | Where-Object Type -NE 'ExternalActual')
         $scheduled = 0d
-        foreach ($effect in $monthEffects) { $scheduled += [decimal]$effect.Net }
+        foreach ($effect in $plannedEffects) { $scheduled += [decimal]$effect.Net }
         $row = [ordered]@{
-            Month = $month; Kind = 'Forecast'; Days = $days; DaysWithData = 0; Actual = 0d; Scheduled = 0d; ScheduledAlreadyPosted = 0d
+            Month = $month; Kind = 'Forecast'; Days = $days; DaysWithData = 0; Actual = 0d; AddedActual = 0d; Scheduled = 0d; ScheduledAlreadyPosted = 0d
             RunRateLow = 0d; RunRateCentral = 0d; RunRateHigh = 0d; TotalLow = 0d; TotalCentral = 0d; TotalHigh = 0d
             Horizon = $null; Note = ''
         }
@@ -476,7 +570,9 @@ function Invoke-ForecastProjection {
                 $row.Kind = 'Actual'; $row.Actual = [decimal]$data.Headline; $row.DaysWithData = $days
             }
             else { $row.Kind = 'MissingActual'; $row.Note = 'No final data for this month.' }
-            foreach ($path in 'Low', 'Central', 'High') { $row["Total$path"] = $row.Actual }
+            foreach ($effect in $plannedEffects) { & $record $effect $false 'PastMonth' }
+            foreach ($effect in $actualEffects) { $row.AddedActual += [decimal]$effect.Net; & $record $effect $true 'Counted' }
+            foreach ($path in 'Low', 'Central', 'High') { $row["Total$path"] = $row.Actual + $row.AddedActual }
             $rows.Add([pscustomobject]$row)
             continue
         }
@@ -495,6 +591,7 @@ function Invoke-ForecastProjection {
             $row.Actual = [decimal]$data.Headline
             $row.DaysWithData = $days
             $row.Note = if ($row.Kind -eq 'ProvisionalActual') { 'Full month of data that isn''t final yet.' } else { 'Final month after the lookback window.' }
+            foreach ($effect in $plannedEffects) { & $record $effect $false 'PastMonth' }
         }
         elseif ($covered -gt 0) {
             $row.Kind = 'PartialActual'
@@ -504,14 +601,24 @@ function Invoke-ForecastProjection {
             $posted = $postedCommitments[$month]
             $postedIds = [Collections.Generic.List[string]]::new()
             $unlinked = [Collections.Generic.List[string]]::new()
-            foreach ($effect in $monthEffects) {
+            $renewals = [Collections.Generic.List[string]]::new()
+            foreach ($effect in $plannedEffects) {
                 $isPosted = $false
                 if ($posted -and $effect.CommitmentId) { foreach ($id in $posted) { if (Test-ForecastCommitmentMatch -Scheduled $effect.CommitmentId -Posted $id) { $isPosted = $true; break } } }
-                if ($isPosted) { $scheduled -= [decimal]$effect.Net; $row.ScheduledAlreadyPosted += [decimal]$effect.Net; $postedIds.Add($effect.Id) }
-                elseif ($posted -and -not $effect.CommitmentId -and $effect.Type -in 'Purchase', 'Renewal') { $unlinked.Add($effect.Id) }
+                if ($isPosted) { $scheduled -= [decimal]$effect.Net; $row.ScheduledAlreadyPosted += [decimal]$effect.Net; $postedIds.Add($effect.Id); & $record $effect $false 'AlreadyPosted'; continue }
+                & $record $effect $true 'Counted'
+                if ($posted -and -not $effect.CommitmentId -and $effect.Type -in 'Purchase', 'Renewal') { $unlinked.Add($effect.Id) }
+                # Renewing creates a new reservation or savings plan, so the renewal bills under its own order ID.
+                elseif ($posted -and $effect.Type -eq 'Renewal') { $renewals.Add($effect.Id) }
             }
             if ($postedIds.Count) { $row.Note += " Scheduled item(s) $($postedIds -join ', ') already posted this month, so they're counted in the actuals, not added again." }
             if ($unlinked.Count) { $row.Note += " Purchases have posted this month; scheduled item(s) $($unlinked -join ', ') have no commitment ID, so check they aren't already in the actuals." }
+            if ($renewals.Count) { $row.Note += " Purchases have posted this month; renewal item(s) $($renewals -join ', ') may have posted under a new order ID, so check they aren't already in the actuals." }
+        }
+        else { foreach ($effect in $plannedEffects) { & $record $effect $true 'Counted' } }
+        foreach ($effect in $actualEffects) {
+            if ($row.Kind -eq 'Forecast') { & $record $effect $false 'NotStarted' }
+            else { $row.AddedActual += [decimal]$effect.Net; & $record $effect $true 'Counted' }
         }
         $row.Scheduled = $scheduled
         foreach ($path in $paths.Keys) {
@@ -521,7 +628,7 @@ function Invoke-ForecastProjection {
                 $forecast = [decimal]$Baseline.Value * (Get-ForecastCompound -Rate $rate -Periods $horizon) * ([decimal]$days / 30d) * $remaining
             }
             $row["RunRate$path"] = $forecast
-            $row["Total$path"] = $row.Actual + $forecast + $(if ($row.Kind -in 'Actual', 'ProvisionalActual') { 0d } else { $scheduled })
+            $row["Total$path"] = $row.Actual + $row.AddedActual + $forecast + $(if ($row.Kind -in 'Actual', 'ProvisionalActual') { 0d } else { $scheduled })
         }
         if ($row.Kind -in 'Actual', 'ProvisionalActual') { $row.Scheduled = 0d }
         $rows.Add([pscustomobject]$row)
@@ -532,15 +639,53 @@ function Invoke-ForecastProjection {
         foreach ($row in $rows) { $sum += [decimal]$row."Total$path" }
         $totals[$path] = $sum
     }
-    $actualToDate = 0d; $scheduledTotal = 0d; $remainingCentral = 0d
-    foreach ($row in $rows) { $actualToDate += [decimal]$row.Actual; $scheduledTotal += [decimal]$row.Scheduled; $remainingCentral += [decimal]$row.RunRateCentral }
+    $actualToDate = 0d; $addedActual = 0d; $scheduledTotal = 0d; $remainingCentral = 0d
+    foreach ($row in $rows) { $actualToDate += [decimal]$row.Actual; $addedActual += [decimal]$row.AddedActual; $scheduledTotal += [decimal]$row.Scheduled; $remainingCentral += [decimal]$row.RunRateCentral }
     [pscustomobject]@{
         Rows = $rows.ToArray()
         FiscalYear = $FiscalYear
         TotalLow = $totals.Low; TotalCentral = $totals.Central; TotalHigh = $totals.High
-        ActualToDate = $actualToDate; Scheduled = $scheduledTotal; RemainingRunRateCentral = $remainingCentral
+        ActualToDate = $actualToDate; AddedActual = $addedActual; Scheduled = $scheduledTotal; RemainingRunRateCentral = $remainingCentral
         MissingActualMonths = @($rows | Where-Object Kind -EQ 'MissingActual' | ForEach-Object Month)
+        Effects = $outcomes.ToArray()
     }
+}
+
+function Get-ForecastScheduleSummary {
+    # What each valid scheduled item adds to the fiscal year, and why any
+    # occurrence doesn't count: its month has ended, so only actual cost
+    # counts there; it already posted this month; or, for an external
+    # actual, its month hasn't started. An item that adds nothing, and
+    # didn't post, gets a warning, since it's most likely dated wrong.
+    param([AllowEmptyCollection()][object[]]$Items, [AllowEmptyCollection()][object[]]$Effects, [Parameter(Mandatory)]$FiscalYear)
+    $issues = [Collections.Generic.List[object]]::new()
+    $rows = foreach ($item in @($Items | Where-Object { $_ })) {
+        $id = [string]$item.id
+        $mine = @($Effects | Where-Object { $_ -and [string]$_.Id -eq $id })
+        $counted = @($mine | Where-Object Counted)
+        $added = 0d
+        foreach ($effect in $counted) { $added += [decimal]$effect.Net }
+        $ended = @($mine | Where-Object Status -EQ 'PastMonth' | ForEach-Object Month)
+        $posted = @($mine | Where-Object Status -EQ 'AlreadyPosted' | ForEach-Object Month)
+        $notStarted = @($mine | Where-Object Status -EQ 'NotStarted' | ForEach-Object Month)
+        $status = if ($counted.Count -and $counted.Count -eq $mine.Count) { 'Counted' } elseif ($counted.Count) { 'Partly counted' } elseif ($posted.Count) { 'Already posted' } else { 'No effect' }
+        $reasons = @()
+        if (-not $mine.Count) { $reasons += "it has no occurrence from $($FiscalYear.FirstMonth) to $($FiscalYear.LastMonth)" }
+        if ($ended.Count) { $reasons += "$(Join-ForecastMonthList $ended) $(if ($ended.Count -eq 1) { 'has' } else { 'have' }) already ended, so only actual cost counts there" }
+        if ($posted.Count) { $reasons += "it already posted in $(Join-ForecastMonthList $posted), so it's in the actuals" }
+        if ($notStarted.Count) { $reasons += "$(Join-ForecastMonthList $notStarted) $(if ($notStarted.Count -eq 1) { 'hasn''t' } else { 'haven''t' }) started, and an external actual adds only to a month that has" }
+        if ($status -eq 'No effect') {
+            $hint = if ($ended.Count -and [string]$item.type -ne 'ExternalActual') { ' To add cost that''s already billed but isn''t in the data, make it an external actual.' } else { '' }
+            $issues.Add((New-ForecastIssue -Code 'SCH-NOEFFECT' -Severity 'Warn' -Message "Scheduled item $(ConvertTo-ForecastSafeText $id 64) changes nothing in $($FiscalYear.Label): $($reasons -join '; ').$hint" -Subject $id))
+        }
+        [pscustomobject]@{
+            Id = $id; Type = [string]$item.type; Description = ConvertTo-ForecastSafeText ([string]$item.description) 200; Recurrence = [string]$item.recurrence
+            StartMonth = [string]$item.startMonth; EndMonth = [string]$item.endMonth; Amount = Read-ForecastDecimal -Value $item.amount; Treatment = [string]$item.baselineTreatment
+            CommitmentId = [string]$item.commitmentId; Months = @($counted | ForEach-Object Month); Added = $added; Status = $status
+            Note = if ($reasons.Count) { ($reasons -join '; ').Substring(0, 1).ToUpperInvariant() + ($reasons -join '; ').Substring(1) + '.' } else { '' }
+        }
+    }
+    [pscustomobject]@{ Items = @($rows); Issues = $issues.ToArray() }
 }
 
 function Invoke-ForecastModel {
@@ -561,17 +706,20 @@ function Invoke-ForecastModel {
     $schedule = Test-ForecastScheduledItems -Items @($Settings.scheduledItems) -Reviews $Reviews -ScopeKey $scopeKey
     $effects = Get-ForecastScheduleEffects -Items $schedule.Valid -Months $fiscalYear.Months
     $projection = Invoke-ForecastProjection -Dataset $Dataset -Window $window -Growth $growth -Baseline $baseline -FiscalYear $fiscalYear -ScheduleEffects $effects
+    $scheduleSummary = Get-ForecastScheduleSummary -Items $schedule.Valid -Effects $projection.Effects -FiscalYear $fiscalYear
+    $renewals = Get-ForecastRenewalReviews -Dataset $Dataset -Settings $Settings -Window $window -FiscalYear $fiscalYear -Reviews $Reviews -ScopeKey $scopeKey
 
     $reviewItems = [Collections.Generic.List[object]]::new()
     foreach ($comparison in $comparisons.Items) { if ($comparison.Review) { $reviewItems.Add($comparison.Review) } }
     if ($baseline.Review) { $reviewItems.Add($baseline.Review) }
     foreach ($item in $schedule.Reviews) { $reviewItems.Add($item) }
+    foreach ($item in @($renewals)) { $reviewItems.Add($item) }
 
     [pscustomobject]@{
         AsOf = (ConvertFrom-ForecastDate -Value $AsOf); ScopeKey = $scopeKey; Currency = $Dataset.Currency
         Window = $window; Comparisons = $comparisons; Growth = $growth; Baseline = $baseline
-        FiscalYear = $fiscalYear; Schedule = $schedule; ScheduleEffects = $effects; Projection = $projection
+        FiscalYear = $fiscalYear; Schedule = $schedule; ScheduleEffects = $projection.Effects; ScheduleSummary = $scheduleSummary.Items; Projection = $projection
         Reviews = $reviewItems.ToArray()
-        Issues = @($window.Issues) + @($schedule.Issues)
+        Issues = @($window.Issues) + @($schedule.Issues) + @($scheduleSummary.Issues)
     }
 }

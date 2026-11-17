@@ -254,6 +254,30 @@ Describe 'Copilot review regressions' {
         $html | Should -Match '<th scope="col">Currency</th>'
     }
 
+    It 'Lists scheduled items with what each adds, and shows actual cost added by hand on its own line' {
+        $html = InModuleScope FinOpsForecast {
+            $items = @(
+                [pscustomobject]@{ Id = 'ea-july'; Type = 'ExternalActual'; Description = 'EA charges before the move'; Recurrence = 'OneTime'; StartMonth = '2026-07'; EndMonth = ''; Amount = 500d; Treatment = 'Additive'; CommitmentId = ''; Months = @('2026-07'); Added = 500d; Status = 'Counted'; Note = '' }
+                [pscustomobject]@{ Id = 'misdated'; Type = 'BusinessChange'; Description = 'Synthetic change'; Recurrence = 'OneTime'; StartMonth = '2026-08'; EndMonth = ''; Amount = 100d; Treatment = 'Additive'; CommitmentId = ''; Months = @(); Added = 0d; Status = 'No effect'; Note = '2026-08 has already ended, so only actual cost counts there.' }
+            )
+            $proposal = [pscustomobject]@{ Decision = 'Pending'; Proposal = [pscustomobject]@{ amount = '30' } }
+            $fy = [pscustomobject]@{ Label = 'FY2027'; FirstMonth = '2026-07'; LastMonth = '2027-06' }
+            $projection = [pscustomobject]@{ TotalCentral = 1600d; ActualToDate = 1000d; AddedActual = 100d; RemainingRunRateCentral = 400d; Scheduled = 100d; TotalLow = 1500d; TotalHigh = 1700d }
+            [pscustomobject]@{
+                Items = ConvertTo-ForecastScheduledItemsHtml -Items $items -Reviews @($proposal) -FiscalYear $fy
+                Composition = ConvertTo-ForecastCompositionHtml -Projection $projection -Currency 'USD'
+                Plain = ConvertTo-ForecastCompositionHtml -Projection ($projection | Select-Object * -ExcludeProperty AddedActual) -Currency 'USD'
+            }
+        }
+        $html.Items | Should -Match '<td>External actual</td>'
+        $html.Items | Should -Match '<th scope="col"[^>]*>Adds to FY2027</th>'
+        $html.Items | Should -Match '<td class="severity-yellow">No effect</td>'
+        $html.Items | Should -Match '2026-08 has already ended, so only actual cost counts there\.'
+        $html.Items | Should -Match '1 proposed item is waiting for a decision\. It isn&#39;t in the forecast until someone adds it;'
+        $html.Composition | Should -Match 'Actual cost added by hand</th><td class="numeric-cell">100\.00</td>'
+        $html.Plain | Should -Not -Match 'added by hand' -Because 'the line appears only when something was added'
+    }
+
     It 'Fits a chart axis from <Min> to <Max> in round steps of <Step>' -ForEach @(
         @{ Min = 0; Max = 1.007; Step = 0.2 }
         @{ Min = 0; Max = 126572.34; Step = 25000 }

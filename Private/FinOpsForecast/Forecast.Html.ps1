@@ -29,6 +29,14 @@ $script:ForecastHtmlTones = @{
     # Source read status.
     'Rows' = 'severity-green'; 'No rows' = 'severity-yellow'; 'Partly read' = 'severity-yellow'; 'Not attempted' = 'severity-yellow'
     'Unsupported offer' = 'severity-red'; 'Access denied' = 'severity-red'; 'Failed' = 'severity-red'
+    # Scheduled items.
+    'Counted' = 'severity-green'; 'Already posted' = 'severity-green'; 'No effect' = 'severity-yellow'
+}
+# Scheduled item values in plain words.
+$script:ForecastHtmlScheduleWords = @{
+    Purchase = 'Purchase'; Renewal = 'Renewal'; BusinessChange = 'Business change'; ExternalActual = 'External actual'
+    OneTime = 'One time'; Monthly = 'Monthly'; Annual = 'Every year'
+    Additive = 'Adds the amount'; AlreadyInBaseline = 'Already in the run rate'; ReplacesBaselineAmount = 'Replaces part of the run rate'
 }
 # Column widths in rem by format. Text columns share what's left.
 $script:ForecastHtmlWidths = @{ month = 7; amount = 8.5; percent = 6.5; bool = 5.5; status = 9.5; date = 7.5; number = 6 }
@@ -415,6 +423,7 @@ function ConvertTo-ForecastCompositionHtml {
     $total = [decimal]$Projection.TotalCentral
     $parts = @(
         [pscustomobject]@{ Class = 'actual'; Label = 'Actuals to date'; Value = [decimal]$Projection.ActualToDate }
+        if ([decimal]$Projection.AddedActual) { [pscustomobject]@{ Class = 'added'; Label = 'Actual cost added by hand'; Value = [decimal]$Projection.AddedActual } }
         [pscustomobject]@{ Class = 'forecast'; Label = 'Forecast for the rest of the year'; Value = [decimal]$Projection.RemainingRunRateCentral }
         [pscustomobject]@{ Class = 'scheduled'; Label = 'Scheduled items'; Value = [decimal]$Projection.Scheduled }
     )
@@ -442,11 +451,11 @@ function Get-ForecastQuarterRows {
     $quarters = [Collections.Generic.List[object]]::new()
     for ($start = 0; $start -lt $rows.Count; $start += 3) {
         $members = @($rows[$start..([math]::Min($start + 2, $rows.Count - 1))])
-        $sum = [ordered]@{ Actual = 0d; RunRateCentral = 0d; Scheduled = 0d; TotalLow = 0d; TotalCentral = 0d; TotalHigh = 0d }
+        $sum = [ordered]@{ Actual = 0d; AddedActual = 0d; RunRateCentral = 0d; Scheduled = 0d; TotalLow = 0d; TotalCentral = 0d; TotalHigh = 0d }
         foreach ($row in $members) { foreach ($name in @($sum.Keys)) { $sum[$name] += [decimal]$row.$name } }
         $quarters.Add([pscustomobject]@{
                 Quarter = "Q$($quarters.Count + 1)"; Months = Format-ForecastMonthRange -First $members[0].Month -Last $members[-1].Month
-                Actual = $sum.Actual; Forecast = $sum.RunRateCentral; Scheduled = $sum.Scheduled
+                Actual = $sum.Actual; AddedActual = $sum.AddedActual; Forecast = $sum.RunRateCentral; Scheduled = $sum.Scheduled
                 TotalLow = $sum.TotalLow; TotalCentral = $sum.TotalCentral; TotalHigh = $sum.TotalHigh
             })
     }
@@ -456,15 +465,21 @@ function Get-ForecastQuarterRows {
 function ConvertTo-ForecastQuarterHtml {
     param([Parameter(Mandatory)]$Projection)
     $fy = $Projection.FiscalYear
-    $amounts = 'Actual', 'Forecast', 'Scheduled', 'TotalLow', 'TotalCentral', 'TotalHigh'
+    # Actual cost added by hand gets its own column only when there is some.
+    $labels = [ordered]@{ Actual = 'Actual' }
+    if ([decimal]$Projection.AddedActual) { $labels.AddedActual = 'Added by hand' }
+    foreach ($entry in ([ordered]@{ Forecast = 'Forecast'; Scheduled = 'Scheduled'; TotalLow = 'Low'; TotalCentral = 'Central'; TotalHigh = 'High' }).GetEnumerator()) { $labels[$entry.Key] = $entry.Value }
+    $amounts = @($labels.Keys)
     $sb = [Text.StringBuilder]::new()
-    [void]$sb.Append('<div class="table-scroll"><table class="statement quarters"><thead><tr><th scope="col">Quarter</th><th scope="col">Months</th><th scope="col" class="numeric-cell">Actual</th><th scope="col" class="numeric-cell">Forecast</th><th scope="col" class="numeric-cell">Scheduled</th><th scope="col" class="numeric-cell">Low</th><th scope="col" class="numeric-cell">Central</th><th scope="col" class="numeric-cell">High</th></tr></thead><tbody>')
+    [void]$sb.Append('<div class="table-scroll"><table class="statement quarters"><thead><tr><th scope="col">Quarter</th><th scope="col">Months</th>')
+    foreach ($name in $amounts) { [void]$sb.Append("<th scope=""col"" class=""numeric-cell"">$(ConvertTo-ForecastHtmlText $labels[$name])</th>") }
+    [void]$sb.Append('</tr></thead><tbody>')
     foreach ($quarter in (Get-ForecastQuarterRows -Projection $Projection)) {
         [void]$sb.Append("<tr><th scope=""row"">$($quarter.Quarter)</th><td>$(ConvertTo-ForecastHtmlText $quarter.Months)</td>")
         foreach ($name in $amounts) { [void]$sb.Append("<td class=""numeric-cell"">$(ConvertTo-ForecastHtmlText (Format-ForecastAmount $quarter.$name))</td>") }
         [void]$sb.Append('</tr>')
     }
-    $totals = [pscustomobject]@{ Actual = $Projection.ActualToDate; Forecast = $Projection.RemainingRunRateCentral; Scheduled = $Projection.Scheduled; TotalCentral = $Projection.TotalCentral; TotalLow = $Projection.TotalLow; TotalHigh = $Projection.TotalHigh }
+    $totals = [pscustomobject]@{ Actual = $Projection.ActualToDate; AddedActual = $Projection.AddedActual; Forecast = $Projection.RemainingRunRateCentral; Scheduled = $Projection.Scheduled; TotalCentral = $Projection.TotalCentral; TotalLow = $Projection.TotalLow; TotalHigh = $Projection.TotalHigh }
     [void]$sb.Append("</tbody><tfoot><tr><th scope=""row"">$(ConvertTo-ForecastHtmlText $fy.Label)</th><td>$(ConvertTo-ForecastHtmlText (Format-ForecastMonthRange -First $fy.FirstMonth -Last $fy.LastMonth))</td>")
     foreach ($name in $amounts) { [void]$sb.Append("<td class=""numeric-cell"">$(ConvertTo-ForecastHtmlText (Format-ForecastAmount $totals.$name))</td>") }
     [void]$sb.Append('</tr></tfoot></table></div>')
@@ -565,6 +580,7 @@ function ConvertTo-ForecastFiscalYearChartHtml {
     $suffix = if ($Currency) { " $Currency" } else { '' }
     $columns = foreach ($row in $rows) {
         $kind = [string]$row.Kind
+        $added = [decimal]$row.AddedActual
         $segments = [Collections.Generic.List[object]]::new()
         switch ($kind) {
             'Actual' { $segments.Add([pscustomobject]@{ Value = $row.Actual; Class = 'actual' }) }
@@ -576,14 +592,17 @@ function ConvertTo-ForecastFiscalYearChartHtml {
                 if ([decimal]$row.Scheduled -ne 0) { $segments.Add([pscustomobject]@{ Value = $row.Scheduled; Class = 'scheduled' }) }
             }
         }
+        if ($added -ne 0) { $segments.Insert([math]::Min(1, $segments.Count), [pscustomobject]@{ Value = $added; Class = 'added' }) }
         $ranged = $kind -in 'PartialActual', 'Forecast' -and [decimal]$row.TotalHigh -ne [decimal]$row.TotalLow
+        $addedText = if ($added -ne 0) { " + $(Format-ForecastAmount $added) added by hand = $(Format-ForecastAmount $row.TotalCentral)$suffix" } else { '' }
         $tip = switch ($kind) {
-            'MissingActual' { "$(Get-ForecastMonthName -MonthKey $row.Month): no final data" }
-            'Actual' { "$(Get-ForecastMonthName -MonthKey $row.Month), actual: $(Format-ForecastAmount $row.Actual)$suffix" }
-            'ProvisionalActual' { "$(Get-ForecastMonthName -MonthKey $row.Month), actual, not final: $(Format-ForecastAmount $row.Actual)$suffix" }
+            'MissingActual' { "$(Get-ForecastMonthName -MonthKey $row.Month): no final data$(if ($added -ne 0) { "; $(Format-ForecastAmount $added)$suffix added by hand" })" }
+            'Actual' { "$(Get-ForecastMonthName -MonthKey $row.Month), actual: $(Format-ForecastAmount $row.Actual)$(if ($addedText) { $addedText } else { $suffix })" }
+            'ProvisionalActual' { "$(Get-ForecastMonthName -MonthKey $row.Month), actual, not final: $(Format-ForecastAmount $row.Actual)$(if ($addedText) { $addedText } else { $suffix })" }
             default {
                 $pieces = @()
                 if ([decimal]$row.Actual -ne 0) { $pieces += "$(Format-ForecastAmount $row.Actual) actual" }
+                if ($added -ne 0) { $pieces += "$(Format-ForecastAmount $added) added by hand" }
                 $pieces += "$(Format-ForecastAmount $row.RunRateCentral) forecast"
                 if ([decimal]$row.Scheduled -ne 0) { $pieces += "$(Format-ForecastAmount $row.Scheduled) scheduled" }
                 $sum = if ($pieces.Count -gt 1) { "$($pieces -join ' + ') = " } else { '' }
@@ -593,7 +612,7 @@ function ConvertTo-ForecastFiscalYearChartHtml {
         [pscustomobject]@{
             Label = Get-ForecastMonthName -MonthKey $row.Month -Short -NoYear; Sublabel = ([string]$row.Month).Substring(0, 4); Segments = $segments.ToArray()
             Low = $(if ($ranged) { $row.TotalLow } else { $null }); High = $(if ($ranged) { $row.TotalHigh } else { $null })
-            Empty = $kind -eq 'MissingActual'; EmptyLabel = 'No data'; Tip = $tip
+            Empty = $kind -eq 'MissingActual' -and $added -eq 0; EmptyLabel = 'No data'; Tip = $tip
         }
     }
     $columns = @($columns)
@@ -611,6 +630,7 @@ function ConvertTo-ForecastFiscalYearChartHtml {
     if (@($rows | Where-Object { $_.Kind -eq 'Actual' -or ($_.Kind -eq 'PartialActual' -and [decimal]$_.Actual -ne 0) }).Count) { $legend += [pscustomobject]@{ Class = 'actual'; Label = 'Actual' } }
     if (@($rows | Where-Object Kind -EQ 'ProvisionalActual').Count) { $legend += [pscustomobject]@{ Class = 'provisional'; Label = 'Actual, not final' } }
     if ($firstForecast -ge 0) { $legend += [pscustomobject]@{ Class = 'forecast'; Label = 'Forecast (central)' } }
+    if (@($rows | Where-Object { [decimal]$_.AddedActual -ne 0 }).Count) { $legend += [pscustomobject]@{ Class = 'added'; Label = 'Actual cost added by hand' } }
     if (@($rows | Where-Object { [decimal]$_.Scheduled -ne 0 }).Count) { $legend += [pscustomobject]@{ Class = 'scheduled'; Label = 'Scheduled items' } }
     if (@($columns | Where-Object { $null -ne $_.High }).Count) { $legend += [pscustomobject]@{ Class = 'range'; Label = 'Low to high total' } }
     return "<figure class=""chart-figure"">$chart$(ConvertTo-ForecastChartLegend -Entries $legend)</figure>"
@@ -650,16 +670,44 @@ function ConvertTo-ForecastFiscalYearHtml {
     $rows = foreach ($row in @($Projection.Rows)) {
         $row | Select-Object *, @{ Name = 'DaysText'; Expression = { if ($_.Kind -eq 'Forecast') { '' } else { "$($_.DaysWithData) of $($_.Days)" } } }
     }
-    $footer = [ordered]@{ Month = 'Total'; Actual = $Projection.ActualToDate; RunRateCentral = $Projection.RemainingRunRateCentral; Scheduled = $Projection.Scheduled; TotalLow = $Projection.TotalLow; TotalCentral = $Projection.TotalCentral; TotalHigh = $Projection.TotalHigh }
+    $hasAdded = [decimal]$Projection.AddedActual -ne 0
+    $footer = [ordered]@{ Month = 'Total'; Actual = $Projection.ActualToDate; AddedActual = $Projection.AddedActual; RunRateCentral = $Projection.RemainingRunRateCentral; Scheduled = $Projection.Scheduled; TotalLow = $Projection.TotalLow; TotalCentral = $Projection.TotalCentral; TotalHigh = $Projection.TotalHigh }
+    $addedColumn = if ($hasAdded) { @(New-ForecastColumn -Name AddedActual -Label 'Added by hand' -Format amount) } else { @() }
     $sb = [Text.StringBuilder]::new()
     [void]$sb.Append('<h2 id="fiscal-year-heading" tabindex="-1">Fiscal year by month</h2>')
-    [void]$sb.Append('<p class="story-note">Each month''s central total is its actual cost plus its forecast plus scheduled items, and the totals row adds them up. Low and high apply the low and high growth rates to every forecast month. A blank amount is missing; 0.00 is a measured zero.</p>')
+    $sum = if ($hasAdded) { 'Each month''s central total adds its actual cost, actual cost added by hand, forecast, and scheduled items, and the totals row adds up the months.' } else { 'Each month''s central total is its actual cost plus its forecast plus scheduled items, and the totals row adds them up.' }
+    [void]$sb.Append("<p class=""story-note"">$sum Low and high apply the low and high growth rates to every forecast month. A blank amount is missing; 0.00 is a measured zero.</p>")
     [void]$sb.Append((ConvertTo-ForecastHtmlTable -Id 'table-fiscal-year' -Title 'Fiscal year by month' -Rows @($rows) -Footer $footer -Columns @(
-                (New-ForecastColumn -Name Month -Format month), (New-ForecastColumn -Name Kind -Label 'Basis' -Format status -Map $script:ForecastHtmlKinds -Tone),
-                (New-ForecastColumn -Name DaysText -Label 'Days with data' -Width 6), (New-ForecastColumn -Name Actual -Format amount),
-                (New-ForecastColumn -Name RunRateCentral -Label 'Forecast (central)' -Format amount), (New-ForecastColumn -Name Scheduled -Format amount),
-                (New-ForecastColumn -Name TotalLow -Label 'Low' -Format amount), (New-ForecastColumn -Name TotalCentral -Label 'Central' -Format amount),
-                (New-ForecastColumn -Name TotalHigh -Label 'High' -Format amount), (New-ForecastColumn -Name Note))))
+                @((New-ForecastColumn -Name Month -Format month), (New-ForecastColumn -Name Kind -Label 'Basis' -Format status -Map $script:ForecastHtmlKinds -Tone),
+                    (New-ForecastColumn -Name DaysText -Label 'Days with data' -Width 6), (New-ForecastColumn -Name Actual -Format amount)) + $addedColumn + @(
+                    (New-ForecastColumn -Name RunRateCentral -Label 'Forecast (central)' -Format amount), (New-ForecastColumn -Name Scheduled -Format amount),
+                    (New-ForecastColumn -Name TotalLow -Label 'Low' -Format amount), (New-ForecastColumn -Name TotalCentral -Label 'Central' -Format amount),
+                    (New-ForecastColumn -Name TotalHigh -Label 'High' -Format amount), (New-ForecastColumn -Name Note)))))
+    return $sb.ToString()
+}
+
+function ConvertTo-ForecastScheduledItemsHtml {
+    # The scheduled items the person preparing the forecast added, what each
+    # adds to the fiscal year, and why any of it doesn't count, in plain words.
+    param([AllowEmptyCollection()][object[]]$Items = @(), [AllowEmptyCollection()][object[]]$Reviews = @(), [Parameter(Mandatory)]$FiscalYear)
+    $items = @($Items | Where-Object { $_ })
+    $proposed = @($Reviews | Where-Object { $_ -and $_.Decision -eq 'Pending' -and $_.PSObject.Properties.Name -contains 'Proposal' -and $_.Proposal })
+    $label = [string]$FiscalYear.Label
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.Append('<h2 id="scheduled-heading" tabindex="-1">Scheduled items</h2>')
+    [void]$sb.Append('<p class="story-note">The forecast grows usage from the trend in the history. Some costs don''t follow that trend, so they''re added by hand as scheduled items: a reservation or savings plan paid monthly, a renewal, or a known change such as a new project. A purchase, renewal, or business change counts only in months that haven''t ended, because actual cost already shows what was billed. An external actual is the opposite: cost already billed that the data doesn''t include, such as charges under an earlier agreement. It counts in the month it was billed, and never in growth.</p>')
+    if ($proposed.Count) {
+        $wait = if ($proposed.Count -eq 1) { '1 proposed item is waiting for a decision. It isn''t in the forecast until someone adds it;' } else { "$($proposed.Count) proposed items are waiting for a decision. They aren't in the forecast until someone adds them;" }
+        [void]$sb.Append("<p class=""story-note"">$(ConvertTo-ForecastHtmlText $wait) <a class=""report-jump"" data-target=""tab-reviews"" href=""#reviews-heading"">Exceptions and reviews</a> lists $(if ($proposed.Count -eq 1) { 'it' } else { 'them' }).</p>")
+    }
+    $rows = foreach ($item in $items) {
+        $item | Select-Object *, @{ Name = 'TypeText'; Expression = { $script:ForecastHtmlScheduleWords[[string]$_.Type] } }, @{ Name = 'RecurrenceText'; Expression = { $script:ForecastHtmlScheduleWords[[string]$_.Recurrence] } }, @{ Name = 'TreatmentText'; Expression = { if ($_.Type -eq 'ExternalActual') { 'Adds to actuals' } else { $script:ForecastHtmlScheduleWords[[string]$_.Treatment] } } }
+    }
+    [void]$sb.Append((ConvertTo-ForecastHtmlTable -Id 'table-scheduled' -Title 'Scheduled items' -Rows @($rows) -Empty "No scheduled items were added, so $label has none." -Columns @(
+                (New-ForecastColumn -Name Id -Label 'ID' -Width 10), (New-ForecastColumn -Name TypeText -Label 'Type' -Width 8), (New-ForecastColumn -Name Description),
+                (New-ForecastColumn -Name RecurrenceText -Label 'Repeats' -Width 6.5), (New-ForecastColumn -Name StartMonth -Label 'From' -Format month), (New-ForecastColumn -Name EndMonth -Label 'Until' -Format month),
+                (New-ForecastColumn -Name Amount -Label 'Each time' -Format amount), (New-ForecastColumn -Name TreatmentText -Label 'How it counts' -Width 10),
+                (New-ForecastColumn -Name Added -Label "Adds to $label" -Format amount), (New-ForecastColumn -Name Status -Format status -Tone), (New-ForecastColumn -Name Note))))
     return $sb.ToString()
 }
 
@@ -861,6 +909,7 @@ function ConvertTo-ForecastReviewsHtml {
     $pending = @($reviews | Where-Object { $_.Required -and $_.Decision -eq 'Pending' }).Count
     $sb = [Text.StringBuilder]::new()
     [void]$sb.Append('<h2 id="reviews-heading" tabindex="-1">Exceptions and reviews</h2>')
+    [void]$sb.Append('<p class="story-note">A review is a question the data can''t answer on its own, such as whether an unusual month is real growth, or whether a purchase will bill again. Each one lists what was found, the choices, and the decision made, with the reviewer''s reason. A required review must be decided before the forecast is Ready. Until then, the forecast keeps its numbers as they are: an unusual change still counts as growth, and a proposed purchase isn''t added.</p>')
     if ($reviews.Count) { [void]$sb.Append("<p class=""story-note"">$(ConvertTo-ForecastHtmlText "$(Get-ForecastCountText -Count $pending -Singular 'required review is' -Plural 'required reviews are') pending, of $($reviews.Count). Decide them in FinOps Explorer under 5 Exceptions on the forecast's review page.")</p>") }
     [void]$sb.Append((ConvertTo-ForecastHtmlTable -Id 'table-reviews' -Title 'Exceptions and reviews' -Rows $reviews -Empty 'Nothing needed a review.' -Columns @(
                 (New-ForecastColumn -Name Category -Width 8), (New-ForecastColumn -Name Subject -Width 8), (New-ForecastColumn -Name Title), (New-ForecastColumn -Name Required -Format bool),
@@ -1047,6 +1096,7 @@ tr:hover td { background: var(--surface); }
 .chart .seg.actual, .chart .seg.runrate { fill: var(--navy); }
 .chart .seg.forecast, .chart .seg.retained { fill: var(--blue); }
 .chart .seg.scheduled { fill: var(--indigo); }
+.chart .seg.added { fill: var(--turquoise); }
 .chart .seg.provisional { stroke: var(--navy); stroke-width: 1; }
 .chart .seg.excluded { fill: #8A8A8A; }
 .chart .seg.pending { fill: var(--warning); }
@@ -1064,6 +1114,7 @@ tr:hover td { background: var(--surface); }
 .key-actual, .key-runrate { background: var(--navy); }
 .key-forecast, .key-retained { background: var(--blue); }
 .key-scheduled { background: var(--indigo); }
+.key-added { background: var(--turquoise); }
 .key-provisional { border: 1px solid var(--navy); background: repeating-linear-gradient(45deg, var(--navy) 0 2px, #FFFFFF 2px 4px); }
 .key-excluded { background: #8A8A8A; }
 .key-pending { background: var(--warning); }
@@ -1085,6 +1136,7 @@ tr:hover td { background: var(--surface); }
 .composition .actual { background: var(--navy); }
 .composition .forecast { background: var(--blue); }
 .composition .scheduled { background: var(--indigo); }
+.composition .added { background: var(--turquoise); }
 .disclosure ul { margin: 6px 0 0; padding-left: 20px; max-width: 110ch; font-size: 13px; line-height: 1.55; }
 .disclosure li { margin: 4px 0; }
 .disclosure p { font-size: 13px; max-width: 110ch; }
@@ -1416,7 +1468,7 @@ function ConvertTo-ForecastHtml {
     $fy = $Model.Projection.FiscalYear
     $panes = [Collections.Generic.List[object]]::new()
     $panes.Add([pscustomobject]@{ Id = 'overview'; Label = 'Overview'; Html = (ConvertTo-ForecastOverviewHtml -Model $Model -Dataset $Dataset -Readiness $Readiness -Workloads $Workloads -Settings $Settings -ScopeLabel $ScopeLabel) })
-    $panes.Add([pscustomobject]@{ Id = 'fiscal-year'; Label = 'Fiscal year by month'; Html = (ConvertTo-ForecastFiscalYearHtml -Projection $Model.Projection) })
+    $panes.Add([pscustomobject]@{ Id = 'fiscal-year'; Label = 'Fiscal year by month'; Html = (ConvertTo-ForecastFiscalYearHtml -Projection $Model.Projection) + (ConvertTo-ForecastScheduledItemsHtml -Items @($Model.ScheduleSummary) -Reviews @($Readiness.Reviews) -FiscalYear $fy) })
     $panes.Add([pscustomobject]@{ Id = 'history'; Label = 'Monthly history'; Html = (ConvertTo-ForecastHistoryHtml -Model $Model -Currency $currency) })
     $panes.Add([pscustomobject]@{ Id = 'comparisons'; Label = 'Adjacent-month comparisons'; Html = (ConvertTo-ForecastComparisonsHtml -Model $Model) })
     if ($Workloads) { $panes.Add([pscustomobject]@{ Id = 'workloads'; Label = 'Workloads'; Html = (ConvertTo-ForecastWorkloadsHtml -Workloads $Workloads -Currency $currency) }) }

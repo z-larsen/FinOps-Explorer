@@ -427,7 +427,7 @@ function New-ForecastVintage {
         currency = $Session.Dataset.Currency
         dataMode = $Session.Dataset.Mode
         settings = $Session.Settings
-        fiscalYear = [ordered]@{ label = $projection.FiscalYear.Label; firstMonth = $projection.FiscalYear.FirstMonth; lastMonth = $projection.FiscalYear.LastMonth; totalLow = $projection.TotalLow; totalCentral = $projection.TotalCentral; totalHigh = $projection.TotalHigh; actualToDate = $projection.ActualToDate; scheduled = $projection.Scheduled }
+        fiscalYear = [ordered]@{ label = $projection.FiscalYear.Label; firstMonth = $projection.FiscalYear.FirstMonth; lastMonth = $projection.FiscalYear.LastMonth; totalLow = $projection.TotalLow; totalCentral = $projection.TotalCentral; totalHigh = $projection.TotalHigh; actualToDate = $projection.ActualToDate; addedActual = $projection.AddedActual; scheduled = $projection.Scheduled }
         window = [ordered]@{ first = $model.Window.First; last = $model.Window.Last; months = @($model.Window.Rows | ForEach-Object { [ordered]@{ month = $_.Month; status = $_.Status; runRate = $_.RunRate; headline = $_.Headline } }) }
         growth = [ordered]@{ low = $model.Growth.Low; central = $model.Growth.Central; high = $model.Growth.High; retained = $model.Growth.Retained }
         baseline = [ordered]@{ value = $model.Baseline.Value; method = $model.Baseline.Method; month = $model.Baseline.Month }

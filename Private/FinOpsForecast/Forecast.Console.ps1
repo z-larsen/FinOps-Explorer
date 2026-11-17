@@ -144,7 +144,7 @@ function Show-ForecastSetupReview {
                 '1' { Edit-ForecastSources -Root $Root }
                 '2' { Edit-ForecastScope -Root $Root }
                 '3' { Edit-ForecastPeriod -Root $Root }
-                '4' { Edit-ForecastAssumptions -Root $Root }
+                '4' { Edit-ForecastAssumptions -Root $Root -Session $session }
                 '5' { if ($session) { Show-ForecastExceptions -Root $Root -Session $session } }
                 '6' { if ($session) { Show-ForecastReconciliation -Session $session } }
                 '7' { Show-ForecastRefresh -Root $Root }
@@ -185,6 +185,89 @@ function Select-ForecastComparisonReview {
     return New-ForecastComparisonReview -Comparison $change -ScopeKey $Session.Model.ScopeKey -Median $Session.Model.Comparisons.Median -Threshold $Session.Model.Comparisons.Threshold
 }
 
+function Write-ForecastHelpTerm {
+    # A term and its explanation, wrapped under the explanation's column.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Term, [Parameter(Mandatory)][string]$Text, [int]$Width = 22)
+    $room = [math]::Max(30, [math]::Min(96, (Get-MenuWidth 110) - 6) - $Width)
+    $line = ''
+    $first = $true
+    foreach ($word in ($Text -split ' ')) {
+        if ($line -and ($line.Length + 1 + $word.Length) -gt $room) {
+            Write-FinOpsConsole ('    {0}{1}' -f $(if ($first) { $Term.PadRight($Width) } else { ''.PadRight($Width) }), $line)
+            $first = $false
+            $line = $word
+        }
+        else { $line = if ($line) { "$line $word" } else { $word } }
+    }
+    if ($line) { Write-FinOpsConsole ('    {0}{1}' -f $(if ($first) { $Term.PadRight($Width) } else { ''.PadRight($Width) }), $line) }
+}
+
+function Write-ForecastHelpText {
+    # A paragraph, wrapped to the console.
+    param([Parameter(Mandatory)][string]$Text)
+    Write-ForecastHelpTerm -Term '' -Text $Text -Width 0
+}
+
+function Show-ForecastScheduleHelp {
+    # Plain-language help for scheduled items and reviews. It opens from
+    # 4 Assumptions, S; from 5 Exceptions; and from How it works. It only
+    # explains; nothing changes.
+    param([ValidateSet('Scheduled', 'Reviews')][string]$Topic = 'Scheduled', [string]$FiscalYearLabel)
+    $year = if ($FiscalYearLabel) { $FiscalYearLabel } else { 'the fiscal year' }
+    while ($true) {
+        Clear-ForecastScreen
+        if ($Topic -eq 'Scheduled') {
+            Write-ForecastHeading -Title 'How scheduled items work'
+            Write-FinOpsConsole '  Why they''re needed' -ForegroundColor White
+            Write-ForecastHelpText 'The forecast grows cost from how usage changed month to month. Some costs don''t follow that trend: a reservation or savings plan bills a set amount on its own schedule, and a new project or a shutdown changes cost on a date you know. Scheduled items add those costs by hand.'
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  Types' -ForegroundColor White
+            Write-ForecastHelpTerm 'Purchase' 'A commitment billed on a schedule, such as a reservation paid monthly.'
+            Write-ForecastHelpTerm 'Renewal' 'A commitment you expect to buy again, such as a one-year reservation paid up front.'
+            Write-ForecastHelpTerm 'Business change' 'A planned change in cost, such as a migration. Use a negative amount for a reduction.'
+            Write-ForecastHelpTerm 'External actual' 'Cost already billed that the data doesn''t include, such as EA charges before a move to MCA. It''s added to that month''s actuals and never changes growth.'
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  When an item counts' -ForegroundColor White
+            Write-ForecastHelpText "A purchase, renewal, or business change counts only in months that haven't ended, because actual cost already shows what was billed. An external actual counts only in a month that has started. The list shows what each item adds to $year, and warns about any item that adds nothing."
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  How the amount counts' -ForegroundColor White
+            Write-ForecastHelpTerm 'Additive' 'Adds the full amount.' -Width 25
+            Write-ForecastHelpTerm 'AlreadyInBaseline' 'Adds nothing, because today''s cost already includes it.' -Width 25
+            Write-ForecastHelpTerm 'ReplacesBaselineAmount' 'Adds the amount minus the part of today''s cost it replaces.' -Width 25
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  Commitment ID' -ForegroundColor White
+            Write-ForecastHelpText 'For a reservation or savings plan, give its order ID. Then, if it has already billed this month, it isn''t counted twice.'
+        }
+        else {
+            Write-ForecastHeading -Title 'How reviews work'
+            Write-FinOpsConsole '  What a review is' -ForegroundColor White
+            Write-ForecastHelpText 'A question the data can''t answer on its own, such as whether an unusual month is real growth, or whether a purchase will bill again. You decide, and the forecast records your choice, your reason, your name, and the date. The report shows them. If the data behind a decision changes, it asks again.'
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  Required or optional' -ForegroundColor White
+            Write-ForecastHelpText 'REQUIRED reviews must be decided before the forecast is Ready. Optional ones are worth a look. Until you decide, the numbers stay as they are: an unusual change still counts as growth, and a proposed item isn''t added.'
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  To decide one' -ForegroundColor White
+            Write-ForecastHelpText 'In 5 Exceptions, type its number and read what was found. Then type the number of a choice; (suggested) marks the one the forecast would pick. Most choices ask for a reason. When a review proposes a scheduled item, A adds it.'
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole '  Common reviews' -ForegroundColor White
+            Write-ForecastHelpTerm 'RecurringPurchase' 'Billed every month, but not scheduled. A adds it as a monthly item, or choose NotRecurring.'
+            Write-ForecastHelpTerm 'RenewalPurchase' 'Paid up front less than a year ago. Cost data doesn''t show the term, so check it in the Azure portal. A adds it as a yearly item, or choose NotRenewing.'
+            Write-ForecastHelpTerm 'Anomaly' 'A month that moved much more than usual. Retain keeps it in growth, Exclude leaves it out, and StepChange says the new level is real.'
+            Write-ForecastHelpTerm 'AgreementChange' 'Months billed under different agreements, such as EA and MCA, whose prices can differ. Decide it like an anomaly.'
+            Write-ForecastHelpTerm 'Baseline' 'Which month the forecast starts from, when the latest one was unusual.'
+        }
+        $guide = if (Test-Path -LiteralPath $script:ForecastGuidePath) { $script:ForecastGuidePath } else { 'docs\forecast.md in the FinOps Explorer folder' }
+        Write-FinOpsConsole ''
+        Write-FinOpsConsole "  More detail: $guide" -ForegroundColor DarkGray
+        Write-FinOpsConsole "  $(if ($Topic -eq 'Scheduled') { 'R How reviews work' } else { 'S How scheduled items work' })   B Back" -ForegroundColor DarkGray
+        switch (Read-ForecastChoice -Prompt 'Choose' -Valid @('S', 'R', 'B') -Default 'B') {
+            'S' { $Topic = 'Scheduled' }
+            'R' { $Topic = 'Reviews' }
+            default { return }
+        }
+    }
+}
+
 function Show-ForecastExceptions {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)]$Session, [string]$Category)
     while ($true) {
@@ -209,8 +292,12 @@ function Show-ForecastExceptions {
             Write-FinOpsConsole ('  {0,3}  {1,-17} {2,-12} {3}' -f ($i + 1), $item.Category, $flag, (ConvertTo-ForecastSafeText $item.Title 80)) -ForegroundColor $color
         }
         Write-FinOpsConsole ''
-        $answer = Read-ForecastText -Prompt $(if ($changes) { 'Number to review, C to review any month-to-month change, or B to go back' } else { 'Number to review, or B to go back' })
+        $answer = Read-ForecastText -Prompt $(if ($changes) { 'Number to review, C to review any month-to-month change, H for how reviews work, or B to go back' } else { 'Number to review, H for how reviews work, or B to go back' })
         if ($answer -eq '' -or $answer -match '^(?i)b$') { return }
+        if ($answer -match '^(?i)h$') {
+            Show-ForecastScheduleHelp -Topic Reviews -FiscalYearLabel $(if ($Session.Model -and $Session.Model.FiscalYear) { [string]$Session.Model.FiscalYear.Label })
+            continue
+        }
         if ($changes -and $answer -match '^(?i)c$') {
             $item = Select-ForecastComparisonReview -Session $Session
             if (-not $item) { continue }
@@ -229,7 +316,7 @@ function Show-ForecastExceptions {
             Write-FinOpsConsole ('    {0}  {1}{2}' -f ($o + 1), $item.Options[$o], $suggested)
         }
         $proposal = if ($item.PSObject.Properties.Name -contains 'Proposal') { $item.Proposal } else { $null }
-        if ($proposal) { Write-FinOpsConsole "    A  Add the proposed scheduled item: $(Format-ForecastAmount (Read-ForecastDecimal $proposal.amount)) a month from $($proposal.startMonth)" -ForegroundColor Cyan }
+        if ($proposal) { Write-FinOpsConsole "    A  Add the proposed scheduled item: $(Get-ForecastProposalText -Proposal $proposal)" -ForegroundColor Cyan }
         $pick = Read-ForecastText -Prompt $(if ($proposal) { 'Option number, A to add the proposed item, or blank to cancel' } else { 'Option number (blank to cancel)' })
         if ($proposal -and $pick -match '^(?i)a$') {
             $null = Add-ForecastProposedItem -Root $Root -Proposal $proposal

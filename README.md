@@ -479,12 +479,22 @@ answer with a reason, and asks again if the data changes. Press **C** in
 **5 Exceptions** to review any month-to-month change yourself, for example
 after new reservations. That matters most with 3 months of history, where
 nothing is flagged on its own. A forecast is saved only when every required
-check passes.
+check passes. Press **H** in **5 Exceptions**, or in the scheduled items in
+**4 Assumptions**, for a plain-language explanation of how reviews and
+scheduled items work.
 
 It also helps with gaps and commitments:
 
 - A recurring purchase without a scheduled item gets a proposed one. Press
   **A** on its review to add it.
+- A reservation or savings plan paid up front within the last year, which would
+  bill again before the fiscal year ends if it renews, gets a proposed yearly
+  renewal. Cost data doesn't show the term, so the review asks you to check it.
+- Cost already billed that the data doesn't include, such as EA charges before
+  a move to MCA, can be added as an external actual. It shows on its own line
+  and never changes growth.
+- A scheduled item that changes nothing, such as one dated in a month that has
+  ended, is flagged, and the report shows what each item adds.
 - A change between months on different agreements, such as EA and MCA, needs
   a review, because their prices can differ.
 - A month whose charges start partway through is flagged, since that's how a

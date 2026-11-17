@@ -106,6 +106,48 @@ Describe 'Forecast console' {
         @($session.Model.ScheduleEffects | Where-Object Month -EQ '2026-12').Count | Should -Be 1
     }
 
+    It 'Adds an external actual, flags an item that changes nothing, and explains scheduled items and reviews' {
+        $exports = Join-Path $TestDrive 'console-schedule'
+        foreach ($month in (Get-TestMonthKeys -Last '2026-10' -Count 13)) {
+            $total = 100d * [decimal][DateTime]::DaysInMonth([int]$month.Substring(0, 4), [int]$month.Substring(5, 2))
+            $null = New-SyntheticExportRun -Root $exports -Kind 'MCA' -Month $month -Scope $script:ProfileScope -Parts @(, @(New-SyntheticMonthRows -Month $month -Total $total -Workload 'app-alpha'))
+        }
+        $root = Get-Workspace -Name 'console-schedule'
+        InModuleScope FinOpsForecast -Parameters @{ Root = $root; Settings = (New-TestSettings -Root $exports) } { Save-ForecastStoredSettings -Root $Root -Settings $Settings }
+        Set-TestAnswers @(
+            'R', ''
+            '4', 'S', 'H', 'R', 'B'
+            'A', 'EXTERNALACTUAL', 'ea-july', 'EA charges before the move', '2026-07', '500', ''
+            'A', 'BUSINESSCHANGE', 'ONETIME', 'ADDITIVE', 'misdated', 'Synthetic change', '2026-08', '', '100', '', ''
+            'B', 'B'
+            '5', 'H', 'B', 'B'
+            'Q'
+        )
+        InModuleScope FinOpsForecast -Parameters @{ Root = $root; AsOf = $script:AsOf } { Show-ForecastSetupReview -Root $Root -AsOf $AsOf }
+        Get-RedLines | Should -BeNullOrEmpty
+        $script:Answers.Count | Should -Be 0
+        $text = $script:Console.Text -join "`n"
+        $text | Should -Match 'How scheduled items work'
+        $text | Should -Match 'External actual\s+Cost already billed that the data doesn''t include'
+        ([regex]::Matches($text, 'How reviews work\n')).Count | Should -Be 2 -Because 'it opens from the scheduled items help and from 5 Exceptions'
+        $text | Should -Match 'ea-july adds 500\.00 to FY2026\.'
+        $text | Should -Match '! misdated changes nothing in FY2026\. 2026-08 has already ended, so only actual cost counts there\.'
+        @($script:Console | Where-Object { $_.Text -match '^\s+2\s+misdated\s.*no effect$' -and $_.Color -eq 'Yellow' }).Count | Should -BeGreaterThan 0
+        $saved = @((InModuleScope FinOpsForecast -Parameters @{ Root = $root } { Get-ForecastStoredSettings -Root $Root }).scheduledItems)
+        "$($saved[0].type) $($saved[0].recurrence) $($saved[0].baselineTreatment) $($saved[0].startMonth) $($saved[0].amount)" | Should -Be 'ExternalActual OneTime Additive 2026-07 500'
+        $session = InModuleScope FinOpsForecast -Parameters @{ Root = $root; AsOf = $script:AsOf } { Invoke-ForecastEvaluation -Root $Root -AsOf $AsOf }
+        $session.Model.Projection.AddedActual | Should -Be 500
+        @($session.Readiness.Checks | Where-Object Id -EQ 'KEYS')[0].Status | Should -Be 'Warn'
+    }
+
+    It 'Words a proposed renewal as a yearly item' {
+        $root = Get-Workspace -Name 'console-renewal'
+        InModuleScope FinOpsForecast -Parameters @{ Root = $root; Settings = (New-TestSettings) } { Save-ForecastStoredSettings -Root $Root -Settings $Settings }
+        $proposal = [pscustomobject]@{ id = 'renewal-abcdef12'; type = 'Renewal'; description = 'Possible renewal of an up-front purchase'; startMonth = '2026-12'; endMonth = ''; recurrence = 'Annual'; amount = '1200'; baselineTreatment = 'Additive'; replacedAmount = ''; commitmentId = 'ri-synth-upfront' }
+        InModuleScope FinOpsForecast -Parameters @{ Root = $root; Proposal = $proposal } { Add-ForecastProposedItem -Root $Root -Proposal $Proposal } | Should -BeTrue
+        ($script:Console.Text -join "`n") | Should -Match 'Added scheduled item renewal-abcdef12: 1,200\.00 a year from 2026-12, with no end month\. If it won''t renew after that, set its end month in 4 Assumptions, S\.'
+    }
+
     It 'Keeps a filtered Exceptions list to its own category' {
         $session = [pscustomobject]@{ Readiness = [pscustomobject]@{ Reviews = @() }; Model = [pscustomobject]@{ Comparisons = [pscustomobject]@{ Items = @([pscustomobject]@{ Status = 'Defined' }) } } }
         Set-TestAnswers @('')

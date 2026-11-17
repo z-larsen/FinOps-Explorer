@@ -132,7 +132,11 @@ function Test-ForecastReadiness {
     $checks.Add((New-ForecastCheck -Id 'CURRENCY' -Name 'Single billing currency' -Status $(if ($currencyOk) { 'Pass' } else { 'Fail' }) -Detail $(if ($currencyOk) { "All amounts are in $($Dataset.Currency)." } else { $currencyProblem })))
 
     $keyIssues = @(@($Model.Issues) + @($Dataset.Issues) + @($MappingIssues) | Where-Object { $_ -and $_.Severity -eq 'Fail' -and $_.Code -match '^(SCH|MAP|INP)-' })
-    $checks.Add((New-ForecastCheck -Id 'KEYS' -Name 'Unique keys and valid assumptions' -Status $(if ($keyIssues.Count) { 'Fail' } else { 'Pass' }) -Detail $(if ($keyIssues.Count) { ($keyIssues.Message | Select-Object -First 5) -join ' ' } else { 'Scheduled items, mappings, and inputs have unique, valid keys.' })))
+    # A scheduled item that changes nothing is most likely dated wrong; it warns, since the forecast is still right without it.
+    $keyWarnings = @(@($Model.Issues) | Where-Object { $_ -and $_.Severity -eq 'Warn' -and $_.Code -like 'SCH-*' })
+    $keyStatus = if ($keyIssues.Count) { 'Fail' } elseif ($keyWarnings.Count) { 'Warn' } else { 'Pass' }
+    $keyDetail = if ($keyIssues.Count) { ($keyIssues.Message | Select-Object -First 5) -join ' ' } elseif ($keyWarnings.Count) { (($keyWarnings.Message | Select-Object -First 5) -join ' ') + $(if ($keyWarnings.Count -gt 5) { " (and $($keyWarnings.Count - 5) more)" } else { '' }) } else { 'Scheduled items, mappings, and inputs have unique, valid keys.' }
+    $checks.Add((New-ForecastCheck -Id 'KEYS' -Name 'Unique keys and valid assumptions' -Status $keyStatus -Detail $keyDetail))
 
     $boundaryIssue = @($Dataset.Issues | Where-Object Code -EQ 'BND-MISSING')
     # Only MCA data whose first month starts partway through: the days

@@ -92,14 +92,24 @@ function Get-ForecastDisclosure {
     $lines.Add('')
     $lines.Add('FISCAL-YEAR AGGREGATION')
     $fy = $Model.Projection.FiscalYear
-    $lines.Add("- $($fy.Label) runs $($fy.FirstMonth) to $($fy.LastMonth). Total = actuals for completed months + month-to-date actuals and the rest of the current month + forecast for remaining months + scheduled items.")
+    $added = [decimal]$Model.Projection.AddedActual
+    $lines.Add("- $($fy.Label) runs $($fy.FirstMonth) to $($fy.LastMonth). Total = actuals for completed months + month-to-date actuals and the rest of the current month + forecast for remaining months + scheduled items$(if ($added) { ' + actual cost added by hand' }).")
     $lines.Add('- Low and high totals each follow one growth path for every month. They are not sums of independent monthly percentiles.')
-    $lines.Add('- Purchases, refunds, and adjustments stay in actuals but aren''t grown. Future purchases, renewals, and business changes come only from scheduled items.')
-    foreach ($item in @($Model.Schedule.Valid)) {
-        $lines.Add("  - $($item.id) ($($item.type), $($item.recurrence) from $($item.startMonth)$(if ($item.endMonth) { " to $($item.endMonth)" })): amount $(Format-ForecastAmount (Read-ForecastDecimal $item.amount) $currency), treatment $($item.baselineTreatment).")
+    $lines.Add('- Purchases, refunds, and adjustments stay in actuals but aren''t grown. Future purchases, renewals, and business changes come only from scheduled items, and each counts only in months that haven''t ended.')
+    if ($added) { $lines.Add("- Actual cost added by hand (external actuals): $(Format-ForecastAmount $added $currency). It's cost already billed that the data doesn't include, such as charges billed under an earlier agreement. It counts in the fiscal-year total, never in growth or the baseline.") }
+    foreach ($item in @($Model.ScheduleSummary | Where-Object { $_ })) {
+        $effect = switch ($item.Status) {
+            'Counted' { "adds $(Format-ForecastAmount $item.Added $currency) to $($fy.Label)" }
+            'Partly counted' { "adds $(Format-ForecastAmount $item.Added $currency) to $($fy.Label). $($item.Note)" }
+            'Already posted' { "adds nothing more. $($item.Note)" }
+            default { "changes nothing in $($fy.Label). $($item.Note)" }
+        }
+        $lines.Add("  - $($item.Id) ($($item.Type), $($item.Recurrence) from $($item.StartMonth)$(if ($item.EndMonth) { " to $($item.EndMonth)" })): amount $(Format-ForecastAmount $item.Amount $currency), treatment $($item.Treatment); $effect".TrimEnd('.') + '.')
     }
     $proposed = @($Dataset.Reviews | Where-Object { $_ -and $_.Category -eq 'RecurringPurchase' -and $_.Decision -eq 'Pending' -and $_.PSObject.Properties.Name -contains 'Proposal' -and $_.Proposal })
     if ($proposed.Count) { $lines.Add("- $($proposed.Count) recurring purchase(s) have no scheduled item, so they aren't in the forecast. Each review proposes a monthly item from the latest month's amount; add it with A in 5 Exceptions.") }
+    $renewals = @($Model.Reviews | Where-Object { $_ -and $_.Category -eq 'RenewalPurchase' -and $_.Decision -eq 'Pending' })
+    if ($renewals.Count) { $lines.Add("- $($renewals.Count) up-front purchase(s) would bill again within $($fy.Label) if they're on a one-year term and renew. Cost data doesn't show the term, so they aren't in the forecast. Each review proposes an annual item from the purchase's anniversary; check the term, then add it with A in 5 Exceptions or confirm it won't renew.") }
     if ($Dataset.Mode -eq 'Exports') {
         $lines.Add('')
         $lines.Add('WORKLOADS')
@@ -149,6 +159,7 @@ function Get-ForecastSummaryLines {
     $lines.Add("  Central estimate:  $(Format-ForecastAmount $projection.TotalCentral $currency)")
     $lines.Add("  Sensitivity range: $(Format-ForecastAmount $projection.TotalLow $currency) to $(Format-ForecastAmount $projection.TotalHigh $currency)")
     $lines.Add("  Actuals to date:   $(Format-ForecastAmount $projection.ActualToDate $currency)")
+    if ([decimal]$projection.AddedActual) { $lines.Add("  Added by hand:     $(Format-ForecastAmount $projection.AddedActual $currency) (actual cost the data doesn't include)") }
     $lines.Add("  Scheduled items:   $(Format-ForecastAmount $projection.Scheduled $currency)")
     $lines.Add('')
     $lines.Add('Checks')
@@ -188,15 +199,15 @@ function Export-ForecastReport {
     Write-FinOpsReportFile -Directory $directory -Name 'forecast-history.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $history -Columns @('Month', 'Status', 'Days', 'RunRate', 'NormalizedRunRate', 'Purchase', 'Adjustment', 'Other', 'Headline', 'Credit', 'ExcludedMarketplace', 'ExcludedTax', 'ExcludedUnattributed', 'ExcludedBoundary', 'ExcludedScope', 'ExcludedOverlap', 'DataThrough', 'Provenance', 'Note', 'Agreements', 'FirstCharge'))
     $comparisonRows = foreach ($item in @($Model.Comparisons.Items)) { $item | Select-Object *, @{ Name = 'Decision'; Expression = { if ($_.Review) { $_.Review.Decision } else { $null } } }, @{ Name = 'ReviewNote'; Expression = { if ($_.Review) { $_.Review.Note } else { $null } } } }
     Write-FinOpsReportFile -Directory $directory -Name 'forecast-comparisons.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $comparisonRows -Columns @('Index', 'FromMonth', 'ToMonth', 'FromRunRate', 'ToRunRate', 'Change', 'Status', 'Flagged', 'Deviation', 'Suggestion', 'Decision', 'ReviewNote', 'Retained', 'Reason', 'AgreementChange', 'FromAgreements', 'ToAgreements'))
-    Write-FinOpsReportFile -Directory $directory -Name 'forecast-monthly.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Model.Projection.Rows -Columns @('Month', 'Kind', 'Horizon', 'Days', 'DaysWithData', 'Actual', 'Scheduled', 'ScheduledAlreadyPosted', 'RunRateLow', 'RunRateCentral', 'RunRateHigh', 'TotalLow', 'TotalCentral', 'TotalHigh', 'Note'))
+    Write-FinOpsReportFile -Directory $directory -Name 'forecast-monthly.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Model.Projection.Rows -Columns @('Month', 'Kind', 'Horizon', 'Days', 'DaysWithData', 'Actual', 'Scheduled', 'ScheduledAlreadyPosted', 'RunRateLow', 'RunRateCentral', 'RunRateHigh', 'TotalLow', 'TotalCentral', 'TotalHigh', 'Note', 'AddedActual'))
     $fiscal = [pscustomobject]@{
         FiscalYear = $Model.Projection.FiscalYear.Label; FirstMonth = $Model.Projection.FiscalYear.FirstMonth; LastMonth = $Model.Projection.FiscalYear.LastMonth; Currency = $Dataset.Currency
         ActualToDate = $Model.Projection.ActualToDate; Scheduled = $Model.Projection.Scheduled; TotalLow = $Model.Projection.TotalLow; TotalCentral = $Model.Projection.TotalCentral; TotalHigh = $Model.Projection.TotalHigh
         GrowthLow = $Model.Growth.Low; GrowthCentral = $Model.Growth.Central; GrowthHigh = $Model.Growth.High; Baseline = $Model.Baseline.Value; BaselineMethod = $Model.Baseline.Method
-        Status = $Readiness.Status; Labels = $Readiness.Labels
+        Status = $Readiness.Status; Labels = $Readiness.Labels; AddedActual = $Model.Projection.AddedActual
     }
     Write-FinOpsReportFile -Directory $directory -Name 'forecast-fiscal-year.csv' -Lines (ConvertTo-ForecastCsvLines -Rows @($fiscal) -Columns @($fiscal.PSObject.Properties.Name))
-    Write-FinOpsReportFile -Directory $directory -Name 'forecast-scheduled-items.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Model.ScheduleEffects -Columns @('Id', 'Type', 'Month', 'Amount', 'Replaced', 'Net', 'Treatment'))
+    Write-FinOpsReportFile -Directory $directory -Name 'forecast-scheduled-items.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Model.ScheduleEffects -Columns @('Id', 'Type', 'Month', 'Amount', 'Replaced', 'Net', 'Treatment', 'Counted', 'Status'))
     Write-FinOpsReportFile -Directory $directory -Name 'forecast-checks.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Readiness.Checks -Columns @('Id', 'Name', 'Status', 'Detail'))
     Write-FinOpsReportFile -Directory $directory -Name 'forecast-reviews.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Readiness.Reviews -Columns @('Category', 'Subject', 'Title', 'Required', 'Decision', 'Note', 'DecidedUtc', 'Stale', 'Detail', 'Key'))
     Write-FinOpsReportFile -Directory $directory -Name 'forecast-reconciliation.csv' -Lines (ConvertTo-ForecastCsvLines -Rows $Dataset.Reconciliation -Columns @('Month', 'Source', 'RunId', 'Final', 'Rows', 'RawTotal', 'IncludedHeadline', 'Credits', 'ExcludedTax', 'ExcludedMarketplace', 'ExcludedUnattributed', 'ExcludedBoundary', 'ExcludedScope', 'ExcludedOverlap', 'ExcludedOutsideRange', 'Difference', 'Note'))
