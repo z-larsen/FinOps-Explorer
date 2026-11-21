@@ -333,43 +333,76 @@ function Invoke-FinOpsMultitool {
             @($Subscriptions | Where-Object { [string]::IsNullOrWhiteSpace($_.Id) -or $_.TenantId -ne $TenantId }).Count -gt 0) {
             throw 'Export discovery requires the verified selected tenant and subscriptions.'
         }
-        Write-FinOpsConsole "  Reading export definitions for $($Subscriptions.Count) subscription(s), their management-group ancestors, and linked billing accounts..." -ForegroundColor Cyan
-        $exports = @()
-        $discoveryIssues = [Collections.Generic.List[string]]::new()
-        $environmentName = if ($context.Environment.Name) { $context.Environment.Name } else { 'AzureCloud' }
-        $definitionWarnings = @()
-        $storageWarnings = @()
-        try { $exports = @(Find-CostExport -Subscriptions $Subscriptions -Environment $environmentName -TenantId $TenantId -IncludeManagementGroups -IncludeBillingAccounts -SkipRunHistory -WarningAction SilentlyContinue -WarningVariable definitionWarnings) }
-        catch { $discoveryIssues.Add("Export definitions: $($_.Exception.Message)") }
-        if ($definitionWarnings.Count) { Write-FinOpsConsole "  Export definition discovery reported $($definitionWarnings.Count) warning(s). Available choices are retained; use -Verbose for details." -ForegroundColor Yellow }
-        foreach ($warning in @($definitionWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
-        Write-FinOpsConsole "  Export definitions found: $($exports.Count)." -ForegroundColor DarkGray
-        $knownKeys = @{}
-        foreach ($export in $exports) {
-            if ($export.StorageResourceId -and $export.Container -and $export.Name) { $knownKeys["$($export.StorageResourceId)|$($export.Container)|$(([string]$export.RootFolder).Trim('/'))|$($export.Name)".ToLowerInvariant()] = $true }
-        }
-        # Runs even when definitions exist and is deduped against them: a cross-tenant
-        # scan commonly sees some subscriptions' exports while a central
-        # management-group export stays invisible to Cost Management.
-        Write-FinOpsConsole '  Scanning storage accounts in the selected subscriptions for exports Cost Management cannot see...' -ForegroundColor Cyan
-        $definitionCount = $exports.Count
-        $storageSkipped = $false
-        try {
-            $stores = @(Get-ExportStorageCandidates -Subscriptions $Subscriptions -WarningAction SilentlyContinue -WarningVariable storageWarnings)
-            if ($stores.Count -gt 100 -and -not $NonInteractive) {
-                Write-FinOpsConsole "  Found $($stores.Count) storage accounts. Azure allows 100 container listings per 5 minutes in each subscription and region, so scanning them all can be slow." -ForegroundColor Yellow
-                Write-FinOpsConsole "  Scan all $($stores.Count) storage accounts? " -ForegroundColor White -NoNewline
-                Write-FinOpsConsole '(N = skip the storage scan)' -ForegroundColor DarkGray
-                $storageSkipped = (Read-FinOpsAnswer '  Select [Y/N]: ') -notmatch '^(?i)(y|yes)$'
+        # Remembered locations skip the slow definition and storage search on later runs.
+        # Interactive only, so unattended runs stay reproducible and never write state.
+        $cacheDirectory = $null
+        $remembered = $null
+        if (-not $NonInteractive) {
+            try {
+                $cacheDirectory = Join-Path (Split-Path -Path (Get-FinOpsReportRoot) -Parent) 'ExportLocations'
+                $remembered = Read-ExportLocationCache -Directory $cacheDirectory -TenantId $TenantId
             }
-            if ($storageSkipped) { $discoveryIssues.Add("Export storage: skipped $($stores.Count) storage accounts by choice, so exports Cost Management can't see weren't checked.") }
-            else { $exports += @(Find-CostExportFromStorage -Subscriptions $Subscriptions -StorageAccounts $stores -Environment $environmentName -KnownKeys $knownKeys -WarningAction SilentlyContinue -WarningVariable +storageWarnings) }
+            catch { $cacheDirectory = $null; Write-Verbose "Non-fatal: remembered export locations are unavailable. $($_.Exception.Message)" }
         }
-        catch { $discoveryIssues.Add("Export storage: $($_.Exception.Message)") }
-        if ($storageWarnings.Count) { Write-FinOpsConsole "  Storage discovery reported $($storageWarnings.Count) warning(s). Unreadable locations were skipped, not treated as empty. Available export choices are retained; use -Verbose for details." -ForegroundColor Yellow }
-        foreach ($warning in @($storageWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
-        if (-not $storageSkipped) { Write-FinOpsConsole "  Additional exports found directly in storage: $($exports.Count - $definitionCount)." -ForegroundColor DarkGray }
-        foreach ($issue in $discoveryIssues) { Write-FinOpsConsole "  $issue" -ForegroundColor Yellow }
+        $useRemembered = $false
+        if ($remembered) {
+            $notSearched = @($Subscriptions | Where-Object { $remembered.SubscriptionIds -notcontains ([string]$_.Id).ToLowerInvariant() }).Count
+            $when = if ($remembered.DiscoveredUtc) { $local = $remembered.DiscoveredUtc.ToLocalTime(); "$($local.ToString('MMMM d, yyyy')) at $($local.ToString('t'))" } else { 'in an earlier run' }
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole "  Remembered export locations for this tenant: $($remembered.Exports.Count), found $when." -ForegroundColor Cyan
+            if (-not $remembered.Complete) { Write-FinOpsConsole '  That search was incomplete: some export definitions or storage accounts couldn''t be read.' -ForegroundColor Yellow }
+            if ($notSearched) { Write-FinOpsConsole "  $notSearched of the selected subscriptions weren't part of that search, so exports stored there might be missing." -ForegroundColor Yellow }
+            Write-FinOpsConsole '    1  Use the remembered locations' -ForegroundColor White
+            Write-FinOpsConsole '    2  Search again (export definitions and storage accounts)' -ForegroundColor White
+            $useRemembered = (Read-FinOpsAnswer '  Select [1-2, Enter = 1]: ') -ne '2'
+        }
+        $searchComplete = $true
+        $searchTime = [datetime]::UtcNow
+        if ($useRemembered) {
+            $exports = @($remembered.Exports)
+            $searchComplete = $remembered.Complete
+            Write-FinOpsConsole '  Remembered locations are checked when the export is read. If an export has moved, run again and choose Search again.' -ForegroundColor DarkGray
+        }
+        else {
+            Write-FinOpsConsole "  Reading export definitions for $($Subscriptions.Count) subscription(s), their management-group ancestors, and linked billing accounts..." -ForegroundColor Cyan
+            $exports = @()
+            $discoveryIssues = [Collections.Generic.List[string]]::new()
+            $environmentName = if ($context.Environment.Name) { $context.Environment.Name } else { 'AzureCloud' }
+            $definitionWarnings = @()
+            $storageWarnings = @()
+            try { $exports = @(Find-CostExport -Subscriptions $Subscriptions -Environment $environmentName -TenantId $TenantId -IncludeManagementGroups -IncludeBillingAccounts -SkipRunHistory -WarningAction SilentlyContinue -WarningVariable definitionWarnings) }
+            catch { $discoveryIssues.Add("Export definitions: $($_.Exception.Message)") }
+            if ($definitionWarnings.Count) { Write-FinOpsConsole "  Export definition discovery reported $($definitionWarnings.Count) warning(s). Available choices are retained; use -Verbose for details." -ForegroundColor Yellow }
+            foreach ($warning in @($definitionWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
+            Write-FinOpsConsole "  Export definitions found: $($exports.Count)." -ForegroundColor DarkGray
+            $knownKeys = @{}
+            foreach ($export in $exports) {
+                if ($export.StorageResourceId -and $export.Container -and $export.Name) { $knownKeys["$($export.StorageResourceId)|$($export.Container)|$(([string]$export.RootFolder).Trim('/'))|$($export.Name)".ToLowerInvariant()] = $true }
+            }
+            # Runs even when definitions exist and is deduped against them: a cross-tenant
+            # scan commonly sees some subscriptions' exports while a central
+            # management-group export stays invisible to Cost Management.
+            Write-FinOpsConsole '  Scanning storage accounts in the selected subscriptions for exports Cost Management cannot see...' -ForegroundColor Cyan
+            $definitionCount = $exports.Count
+            $storageSkipped = $false
+            try {
+                $stores = @(Get-ExportStorageCandidates -Subscriptions $Subscriptions -WarningAction SilentlyContinue -WarningVariable storageWarnings)
+                if ($stores.Count -gt 100 -and -not $NonInteractive) {
+                    Write-FinOpsConsole "  Found $($stores.Count) storage accounts. Azure allows 100 container listings per 5 minutes in each subscription and region, so scanning them all can be slow." -ForegroundColor Yellow
+                    Write-FinOpsConsole "  Scan all $($stores.Count) storage accounts? " -ForegroundColor White -NoNewline
+                    Write-FinOpsConsole '(N = skip the storage scan)' -ForegroundColor DarkGray
+                    $storageSkipped = (Read-FinOpsAnswer '  Select [Y/N]: ') -notmatch '^(?i)(y|yes)$'
+                }
+                if ($storageSkipped) { $discoveryIssues.Add("Export storage: skipped $($stores.Count) storage accounts by choice, so exports Cost Management can't see weren't checked.") }
+                else { $exports += @(Find-CostExportFromStorage -Subscriptions $Subscriptions -StorageAccounts $stores -Environment $environmentName -KnownKeys $knownKeys -WarningAction SilentlyContinue -WarningVariable +storageWarnings) }
+            }
+            catch { $discoveryIssues.Add("Export storage: $($_.Exception.Message)") }
+            if ($storageWarnings.Count) { Write-FinOpsConsole "  Storage discovery reported $($storageWarnings.Count) warning(s). Unreadable locations were skipped, not treated as empty. Available export choices are retained; use -Verbose for details." -ForegroundColor Yellow }
+            foreach ($warning in @($storageWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
+            if (-not $storageSkipped) { Write-FinOpsConsole "  Additional exports found directly in storage: $($exports.Count - $definitionCount)." -ForegroundColor DarkGray }
+            foreach ($issue in $discoveryIssues) { Write-FinOpsConsole "  $issue" -ForegroundColor Yellow }
+            $searchComplete = -not $storageSkipped -and $discoveryIssues.Count -eq 0 -and $definitionWarnings.Count -eq 0 -and $storageWarnings.Count -eq 0
+        }
         $seen = @{}
         $candidates = @($exports | Where-Object {
                 if (-not $_ -or -not $_.StorageResourceId -or -not $_.Container -or -not $_.Name) { return $false }
@@ -388,13 +421,27 @@ function Invoke-FinOpsMultitool {
             }
             throw 'No export candidates could be verified. Some definitions or destinations may be inaccessible; this does not establish that no exports exist. Check access and network connectivity to the intended export destination, then retry with -Verbose for details.'
         }
+        $saveLocations = {
+            param([string]$LastUsedKey)
+            if (-not $cacheDirectory) { return }
+            try {
+                $discoveredUtc = if ($useRemembered -and $remembered.DiscoveredUtc) { $remembered.DiscoveredUtc } else { $searchTime }
+                $searchedIds = if ($useRemembered) { $remembered.SubscriptionIds } else { @($Subscriptions | ForEach-Object { [string]$_.Id }) }
+                Save-ExportLocationCache -Directory $cacheDirectory -TenantId $TenantId -Exports $candidates -SubscriptionIds $searchedIds -DiscoveredUtc $discoveredUtc -Complete $searchComplete -LastUsedKey $LastUsedKey
+            }
+            catch { Write-Verbose "Non-fatal: export locations were not remembered. $($_.Exception.Message)" }
+        }
+        $lastUsedKey = if ($remembered) { $remembered.LastUsedKey } else { $null }
+        if (-not $useRemembered) { & $saveLocations $lastUsedKey }
         Write-FinOpsConsole '  Export data will be filtered to the selected subscriptions. Missing coverage will not be filled with live API costs.' -ForegroundColor DarkGray
         $readable = @($candidates | Where-Object { [string]$_.Format -match '(?i)^csv' -and -not ($_.ScopeKind -ne 'Storage' -and $_.Type -eq 'AmortizedCost') })
+        $lastUsedIndex = 0
         for ($exportIndex = 0; $exportIndex -lt $candidates.Count; $exportIndex++) {
             $candidate = $candidates[$exportIndex]
             $format = if ($candidate.Format) { $candidate.Format } else { 'Unknown format' }
             $scopeLabel = if ($candidate.ScopeLabel) { $candidate.ScopeLabel } elseif ($candidate.SubName) { $candidate.SubName } else { $candidate.ScopeKind }
             $readableLabel = if ($readable -contains $candidate) { '' } else { ' | not readable by this source' }
+            if ($lastUsedKey -and (Get-ExportLocationKey $candidate) -eq $lastUsedKey) { $readableLabel += ' | last used'; $lastUsedIndex = $exportIndex + 1 }
             Write-FinOpsConsole "  [$($exportIndex + 1)] $($candidate.Name) | $format | $($candidate.Type) | $scopeLabel$readableLabel" -ForegroundColor White
             Write-FinOpsConsole "       $($candidate.StorageResourceId) / $($candidate.Container) / $($candidate.RootFolder)" -ForegroundColor DarkGray
         }
@@ -407,7 +454,8 @@ function Invoke-FinOpsMultitool {
         }
         else {
             for ($attempt = 0; $attempt -lt 3 -and -not $selectedExport; $attempt++) {
-                $answer = Read-FinOpsAnswer "  Select export [1-$($candidates.Count)] or C to cancel: "
+                $answer = if ($lastUsedIndex) { Read-FinOpsAnswer "  Select export [1-$($candidates.Count)], Enter = $lastUsedIndex (last used), or C to cancel: " } else { Read-FinOpsAnswer "  Select export [1-$($candidates.Count)] or C to cancel: " }
+                if ($answer -eq '' -and $lastUsedIndex) { $answer = [string]$lastUsedIndex }
                 if ($answer -eq 'C') { throw 'Export selection cancelled. No export data was read.' }
                 $selection = 0
                 if ([int]::TryParse($answer, [ref]$selection) -and $selection -ge 1 -and $selection -le $candidates.Count) { $selectedExport = $candidates[$selection - 1] }
@@ -415,6 +463,7 @@ function Invoke-FinOpsMultitool {
             }
         }
         if (-not $selectedExport) { throw 'No export was selected. No export data was read.' }
+        & $saveLocations (Get-ExportLocationKey $selectedExport)
         if ($selectedExport.Format -notmatch '(?i)^csv') { throw "The selected export uses '$($selectedExport.Format)'. This reader supports CSV and CSV.gz exports; it will not switch to live API costs." }
         if ($selectedExport.ScopeKind -ne 'Storage' -and $selectedExport.Type -eq 'AmortizedCost') { throw 'The selected export contains amortized cost. The current export-backed scans require ActualCost or FOCUS BilledCost; no live fallback was attempted.' }
         Write-FinOpsConsole '  CSV parts are loaded into local memory. For very large exports, use a compatible FinOps Hub Kusto database.' -ForegroundColor Yellow

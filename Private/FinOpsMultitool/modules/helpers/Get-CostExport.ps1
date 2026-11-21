@@ -23,6 +23,8 @@ param()
 # 1. Find-CostExport          - enumerate exports at each subscription scope
 # 2. Get-CostExportData       - read the newest run's CSV into normalized rows
 # 3. ConvertTo-*FromExport    - shape rows into the cost-tool data contracts
+# 4. *-ExportLocationCache    - remember where a tenant's exports live
+#                               between interactive runs
 #
 # Format: CSV only. Parquet exports are detected and reported but not parsed
 #         natively in PowerShell.
@@ -558,6 +560,107 @@ function Find-CostExport {
     Write-Progress -Id 71 -Activity 'Reading Cost Management export definitions' -Completed
 
     return $found
+}
+
+# -- Remembered export locations -----------------------------------------
+# Discovery reads every export definition and then lists containers in every
+# storage account, which can take many minutes. The locations it finds are
+# kept per tenant so a later run can go straight to choosing an export. Only
+# where an export lives is stored: no cost data, keys, or tokens. A remembered
+# location is still verified when it is read, like a freshly found one.
+$script:ExportLocationFields = @('Name', 'SubId', 'SubName', 'Scope', 'ScopeKind', 'ScopeLabel', 'Type', 'Granularity', 'Format', 'Partitioned', 'StorageResourceId', 'Container', 'RootFolder')
+
+function Get-ExportLocationKey {
+    param([Parameter(Mandatory)][object]$Export)
+    return "$($Export.StorageResourceId)|$($Export.Container)|$(([string]$Export.RootFolder).Trim('/'))|$($Export.Name)".ToLowerInvariant()
+}
+
+function Get-ExportLocationCachePath {
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$TenantId)
+    $tenant = [guid]::Empty
+    if (-not [guid]::TryParse($TenantId, [ref]$tenant)) { throw 'Remembered export locations require a tenant ID.' }
+    return (Join-Path $Directory "$($tenant.ToString('D')).json")
+}
+
+# The same path rules Get-CostExportData enforces, so a hand-edited file can't
+# point the reader somewhere unexpected.
+function Test-ExportLocation {
+    param([AllowNull()][object]$Location)
+    if (-not $Location) { return $false }
+    $name = [string]$Location.Name
+    $container = [string]$Location.Container
+    return (-not [string]::IsNullOrWhiteSpace($name) -and $name -notmatch '[/\\\x00-\x1f]' -and $name -notin @('.', '..') -and
+        [string]$Location.StorageResourceId -match '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Storage/storageAccounts/[a-z0-9]{3,24}$' -and
+        $container -cmatch '^[a-z0-9](?:[a-z0-9-]{1,61})[a-z0-9]\z' -and -not $container.Contains('--') -and
+        [string]$Location.RootFolder -notmatch '(?:^|/)\.{1,2}(?:/|$)|[\\\x00-\x1f]')
+}
+
+function Save-ExportLocationCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Exports,
+        [AllowEmptyCollection()][string[]]$SubscriptionIds = @(),
+        [datetime]$DiscoveredUtc = [datetime]::UtcNow,
+        [bool]$Complete = $true,
+        [string]$LastUsedKey
+    )
+    $path = Get-ExportLocationCachePath -Directory $Directory -TenantId $TenantId
+    $locations = @(foreach ($export in @($Exports | Where-Object { Test-ExportLocation $_ })) {
+            $entry = [ordered]@{}
+            foreach ($field in $script:ExportLocationFields) { $entry[$field] = $export.$field }
+            $entry.Partitioned = [bool]$export.Partitioned
+            $entry
+        })
+    $payload = [ordered]@{
+        version         = 1
+        tenantId        = ([guid]$TenantId).ToString('D')
+        discoveredUtc   = $DiscoveredUtc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        complete        = $Complete
+        subscriptionIds = @($SubscriptionIds | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object -Unique)
+        lastUsed        = $LastUsedKey
+        exports         = $locations
+    }
+    $null = New-Item -ItemType Directory -Path $Directory -Force
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($payload | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $path -Force
+    }
+    finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue } }
+}
+
+# Returns $null when there's nothing usable, so the caller simply searches again.
+function Read-ExportLocationCache {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$TenantId)
+    $path = Get-ExportLocationCachePath -Directory $Directory -TenantId $TenantId
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    $data = $null
+    try { $data = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { Write-Verbose "Remembered export locations could not be read and will be ignored: $($_.Exception.Message)"; return $null }
+    if (-not $data -or $data.version -ne 1 -or [string]$data.tenantId -ne ([guid]$TenantId).ToString('D')) { return $null }
+    $exports = @(foreach ($location in @($data.exports | Where-Object { Test-ExportLocation $_ })) {
+            $entry = [ordered]@{}
+            foreach ($field in $script:ExportLocationFields) { $entry[$field] = $location.$field }
+            $entry.Partitioned = [bool]$location.Partitioned
+            [pscustomobject]$entry
+        })
+    if ($exports.Count -eq 0) { return $null }
+    # ConvertFrom-Json turns ISO 8601 text into a DateTime; older files may still hold text.
+    $discovered = $data.discoveredUtc
+    if ($discovered -isnot [datetime]) {
+        $parsed = [datetime]::MinValue
+        $discovered = if ([datetime]::TryParse([string]$discovered, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { $parsed } else { $null }
+    }
+    return [pscustomobject]@{
+        Exports         = $exports
+        SubscriptionIds = @($data.subscriptionIds | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        DiscoveredUtc   = if ($discovered) { $discovered.ToUniversalTime() } else { $null }
+        Complete        = [bool]$data.complete
+        LastUsedKey     = [string]$data.lastUsed
+    }
 }
 
 # -- Enumerate storage accounts across the selected subscriptions ---------
