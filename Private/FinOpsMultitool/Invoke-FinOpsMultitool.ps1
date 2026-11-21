@@ -339,19 +339,18 @@ function Invoke-FinOpsMultitool {
         $remembered = $null
         if (-not $NonInteractive) {
             try {
+                $contextKey = Get-ExportLocationContextKey -Context $context -SubscriptionIds @($Subscriptions.Id)
                 $cacheDirectory = Join-Path (Split-Path -Path (Get-FinOpsReportRoot) -Parent) 'ExportLocations'
-                $remembered = Read-ExportLocationCache -Directory $cacheDirectory -TenantId $TenantId
+                $remembered = Read-ExportLocationCache -Directory $cacheDirectory -ContextKey $contextKey
             }
             catch { $cacheDirectory = $null; Write-Verbose "Non-fatal: remembered export locations are unavailable. $($_.Exception.Message)" }
         }
         $useRemembered = $false
         if ($remembered) {
-            $notSearched = @($Subscriptions | Where-Object { $remembered.SubscriptionIds -notcontains ([string]$_.Id).ToLowerInvariant() }).Count
             $when = if ($remembered.DiscoveredUtc) { $local = $remembered.DiscoveredUtc.ToLocalTime(); "$($local.ToString('MMMM d, yyyy')) at $($local.ToString('t'))" } else { 'in an earlier run' }
             Write-FinOpsConsole ''
-            Write-FinOpsConsole "  Remembered export locations for this tenant: $($remembered.Exports.Count), found $when." -ForegroundColor Cyan
+            Write-FinOpsConsole "  Remembered export locations for this account and subscription selection: $($remembered.Exports.Count), found $when." -ForegroundColor Cyan
             if (-not $remembered.Complete) { Write-FinOpsConsole '  That search was incomplete: some export definitions or storage accounts couldn''t be read.' -ForegroundColor Yellow }
-            if ($notSearched) { Write-FinOpsConsole "  $notSearched of the selected subscriptions weren't part of that search, so exports stored there might be missing." -ForegroundColor Yellow }
             Write-FinOpsConsole '    1  Use the remembered locations' -ForegroundColor White
             Write-FinOpsConsole '    2  Search again (export definitions and storage accounts)' -ForegroundColor White
             $useRemembered = (Read-FinOpsAnswer '  Select [1-2, Enter = 1]: ') -ne '2'
@@ -426,8 +425,7 @@ function Invoke-FinOpsMultitool {
             if (-not $cacheDirectory) { return }
             try {
                 $discoveredUtc = if ($useRemembered -and $remembered.DiscoveredUtc) { $remembered.DiscoveredUtc } else { $searchTime }
-                $searchedIds = if ($useRemembered) { $remembered.SubscriptionIds } else { @($Subscriptions | ForEach-Object { [string]$_.Id }) }
-                Save-ExportLocationCache -Directory $cacheDirectory -TenantId $TenantId -Exports $candidates -SubscriptionIds $searchedIds -DiscoveredUtc $discoveredUtc -Complete $searchComplete -LastUsedKey $LastUsedKey
+                Save-ExportLocationCache -Directory $cacheDirectory -ContextKey $contextKey -Exports $candidates -DiscoveredUtc $discoveredUtc -Complete $searchComplete -LastUsedKey $LastUsedKey
             }
             catch { Write-Verbose "Non-fatal: export locations were not remembered. $($_.Exception.Message)" }
         }
@@ -1560,23 +1558,21 @@ function Invoke-FinOpsMultitool {
                 $exportSubscriptions = @($Subscriptions | Where-Object { $_.Id -in $exportData.CoveredSubscriptionIds })
                 $missingIds = @($Subscriptions.Id | Where-Object { $_ -notin $exportData.CoveredSubscriptionIds })
                 $unattributedNote = ''
-                if ($exportData.UnattributedRowCount -gt 0) {
-                    $rowLabel = if ($exportData.UnattributedRowCount -eq 1) { 'row' } else { 'rows' }
-                    $amounts = @($exportData.UnattributedCost | ForEach-Object { Format-BudgetAmount -Value $_.Cost -Currency $_.Currency }) -join '; '
-                    $unattributedNote = " Not included in these subscription totals: $($exportData.UnattributedRowCount) export $rowLabel with no subscription ($amounts), such as purchases or refunds billed outside a subscription."
+                if ($exportData.ExcludedUnscopedCharges) {
+                    $unattributedNote = ' These totals exclude charges without a subscription ID.'
                 }
                 $exportCoverage = [pscustomobject]@{
                     Name = $DataSource.Export.Name; CoverageIncomplete = ($missingIds.Count -gt 0)
                     CoveredSubscriptionIds = @($exportData.CoveredSubscriptionIds); UnverifiedSubscriptionIds = $missingIds
                     TotalSubs = $Subscriptions.Count; ScannedSubs = $exportSubscriptions.Count
-                    UnattributedRowCount = $exportData.UnattributedRowCount; UnattributedCost = @($exportData.UnattributedCost)
+                    ExcludedUnscopedCharges = $exportData.ExcludedUnscopedCharges
                     ActualPeriod = $exportData.ActualPeriod; DataDate = $exportData.DataDate
                     Note = "Export rows cover $($exportSubscriptions.Count) of $($Subscriptions.Count) selected subscriptions. Subscriptions without returned rows are unverified, not zero cost. Export period: $($exportData.ActualPeriod).$unattributedNote"
                 }
                 $results['_source_Export'] = $exportCoverage
                 $DataSource.CoverageNote = $exportCoverage.Note
                 Write-FinOpsConsole "  Export loaded: $($exportData.RowCount) selected-scope rows; period $($exportData.ActualPeriod)." -ForegroundColor Green
-                Write-FinOpsConsole "  $($exportCoverage.Note)" -ForegroundColor $(if ($missingIds.Count -or $exportData.UnattributedRowCount) { 'Yellow' } else { 'DarkGray' })
+                Write-FinOpsConsole "  $($exportCoverage.Note)" -ForegroundColor $(if ($missingIds.Count -or $exportData.ExcludedUnscopedCharges) { 'Yellow' } else { 'DarkGray' })
             }
             catch { $exportIssue = "Selected export data is unavailable or incomplete: $($_.Exception.Message)" }
         }

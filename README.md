@@ -138,12 +138,11 @@ a container name. Container metadata is checked before blob-service enumeration,
 and unavailable locations produce a summary rather than a warning flood. Use
 `-Verbose` for details. CSV parts are loaded into memory; use Kusto for very large datasets.
 
-Interactive runs remember the export locations a search finds, separately for each
-tenant. On the next run in that tenant, you can use them instead of searching
-again; the export you chose last is marked, and pressing Enter selects it. Choose
-**Search again** when an export has moved or when you selected subscriptions the
-earlier search didn't cover; the prompt tells you when that's the case. Unattended
-runs always search.
+Interactive runs can remember export locations for the same Azure cloud, tenant,
+signed-in account, and set of subscriptions. Press Enter to select the last export
+you used. Choose **Search again** if it moved or its run doesn't confirm the cost
+type. Explorer searches again if the selection changes or it can't verify the
+account or protect the local folder. Unattended runs always search.
 
 Automatic Hub discovery stays within the selected tenant and subscriptions.
 If a Hub can't be verified because discovery probes fail, the tool warns and
@@ -529,9 +528,9 @@ workspace beneath `FinOpsToolkit\Explorer\Forecast`, named for the tenant unless
 you pass a name, with its settings, review decisions, cached history, and saved
 forecasts. The temporary download links for live Cost Management reports are
 never written to the console, the workspace, or any report.
-Export searches also remember where each tenant's exports live, beneath
-`FinOpsToolkit\Explorer\ExportLocations`. Only locations are saved, not cost
-data, keys, or tokens. Delete that folder to forget them.
+Interactive export searches save locations under `FinOpsToolkit\Explorer\ExportLocations`,
+not cost data, keys, or tokens. Explorer ignores older tenant-only files.
+Delete the folder to forget all saved locations.
 
 Reports can include tenant/subscription identifiers, resource names, tags,
 billing information, and costs. Do not upload reports, credentials, access

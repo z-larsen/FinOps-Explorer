@@ -328,7 +328,7 @@ function Select-CostExportData {
         $reason = if (-not $costColumn) { 'it has no recognized cost column' }
         elseif ($basis -eq 'Usage') { "it's a usage-only export, which leaves out purchases such as reservations and Marketplace, so totals would be understated" }
         elseif ($basis -eq 'AmortizedCost') { 'it is an amortized cost export, which spreads purchases instead of showing what was billed' }
-        elseif (-not $basis -or $basis -eq 'Unknown') { 'its dataset type could not be confirmed: it was found in storage, and its newest run has no manifest.json that names the type' }
+        elseif (-not $basis -or $basis -eq 'Unknown') { 'neither the run manifest nor a current export definition confirms the dataset type. If you used a remembered location, choose Search again to check the definition' }
         else { "its dataset type is $basis" }
         throw "The export does not provide actual cost because $reason. Use a FOCUS export (BilledCost) or a 'Cost and usage details (actual)' export."
     }
@@ -342,11 +342,7 @@ function Select-CostExportData {
     $covered = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $rows = [System.Collections.Generic.List[object]]::new()
     $currency = $null
-    # FOCUS permits a null SubAccountId on tenant-level charges such as MCA
-    # purchases and refunds. They belong to no subscription, so a scoped read
-    # excludes them and reports their count and amount in each currency.
-    $unattributedRows = 0
-    $unattributedCost = [System.Collections.Generic.SortedDictionary[string, double]]::new([System.StringComparer]::Ordinal)
+    $excludedUnscopedCharges = $false
     $getRowCurrency = {
         param($Row)
         $value = if ($costColumn -eq 'CostInUSD') { 'USD' }
@@ -368,12 +364,7 @@ function Select-CostExportData {
         if ($rawId -match '^/subscriptions/([0-9a-fA-F-]{36})(?:/|$)') { $rawId = $Matches[1] }
         if ([string]::IsNullOrWhiteSpace($rawId)) {
             if ($expected.Count -eq 0) { throw 'An export row has no subscription ID; coverage is incomplete.' }
-            $excludedAmount = Get-HubCostValue -Row $row -Column $costColumn
-            $excludedCurrency = & $getRowCurrency $row
-            $excludedTotal = 0.0
-            [void]$unattributedCost.TryGetValue($excludedCurrency, [ref]$excludedTotal)
-            $unattributedCost[$excludedCurrency] = $excludedTotal + $excludedAmount
-            $unattributedRows++
+            $excludedUnscopedCharges = $true
             continue
         }
         if (-not [guid]::TryParse($rawId, [ref]$parsedId)) { throw 'An export row has no valid subscription ID; coverage is incomplete.' }
@@ -407,8 +398,7 @@ function Select-CostExportData {
         PeriodsBySubscription = $period.PeriodsBySubscription
         RowCount = $rows.Count; NoData = ($rows.Count -eq 0); CostBasis = 'ActualCost'
         CoveredSubscriptionIds = @($covered); SelectedSubscriptionIds = @($expected)
-        UnattributedRowCount = $unattributedRows
-        UnattributedCost = @(foreach ($entry in $unattributedCost.GetEnumerator()) { [pscustomobject]@{ Currency = $entry.Key; Cost = $entry.Value } })
+        ExcludedUnscopedCharges = $excludedUnscopedCharges
         ExportCount = $ExportData.ExportCount
         Headers = @($columnMap.Keys); NoCostColumn = $false; CoverageIncomplete = $false
     }
@@ -563,23 +553,31 @@ function Find-CostExport {
 }
 
 # -- Remembered export locations -----------------------------------------
-# Discovery reads every export definition and then lists containers in every
-# storage account, which can take many minutes. The locations it finds are
-# kept per tenant so a later run can go straight to choosing an export. Only
-# where an export lives is stored: no cost data, keys, or tokens. A remembered
-# location is still verified when it is read, like a freshly found one.
-$script:ExportLocationFields = @('Name', 'SubId', 'SubName', 'Scope', 'ScopeKind', 'ScopeLabel', 'Type', 'Granularity', 'Format', 'Partitioned', 'StorageResourceId', 'Container', 'RootFolder')
+# A remembered location isn't a current export definition.
+$script:ExportLocationFields = @('Name', 'Format', 'Partitioned', 'StorageResourceId', 'Container', 'RootFolder')
 
 function Get-ExportLocationKey {
     param([Parameter(Mandatory)][object]$Export)
     return "$($Export.StorageResourceId)|$($Export.Container)|$(([string]$Export.RootFolder).Trim('/'))|$($Export.Name)".ToLowerInvariant()
 }
 
-function Get-ExportLocationCachePath {
-    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$TenantId)
-    $tenant = [guid]::Empty
-    if (-not [guid]::TryParse($TenantId, [ref]$tenant)) { throw 'Remembered export locations require a tenant ID.' }
-    return (Join-Path $Directory "$($tenant.ToString('D')).json")
+function Get-ExportLocationContextKey {
+    param([Parameter(Mandatory)][object]$Context, [Parameter(Mandatory)][string[]]$SubscriptionIds)
+    $cloud = [string]$Context.Environment.Name
+    $properties = $Context.Account.ExtendedProperties
+    $homeAccountId = if ($properties) { [string]$properties['HomeAccountId'] }
+    $principal, $homeTenant = [guid]::Empty, [guid]::Empty
+    $parts = ([string]$homeAccountId).Split('.')
+    if ([string]::IsNullOrWhiteSpace($cloud) -or $parts.Count -ne 2 -or
+        -not [guid]::TryParseExact($parts[0], 'D', [ref]$principal) -or $principal -eq [guid]::Empty -or
+        -not [guid]::TryParseExact($parts[1], 'D', [ref]$homeTenant) -or $homeTenant -eq [guid]::Empty) {
+        throw 'Remembering export locations requires a known Azure cloud and a verified account identifier.'
+    }
+    $ids = @($SubscriptionIds | ForEach-Object { ([guid]::Parse($_)).ToString('D') } | Sort-Object -Unique)
+    $key = @($cloud.Trim().ToLowerInvariant(), ([guid]::Parse($Context.Tenant.Id)).ToString('D'), $principal.ToString('D'), $homeTenant.ToString('D')) + $ids
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key -join "`n"))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
 }
 
 # The same path rules Get-CostExportData enforces, so a hand-edited file can't
@@ -599,14 +597,14 @@ function Save-ExportLocationCache {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}\z')][string]$ContextKey,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Exports,
-        [AllowEmptyCollection()][string[]]$SubscriptionIds = @(),
         [datetime]$DiscoveredUtc = [datetime]::UtcNow,
         [bool]$Complete = $true,
         [string]$LastUsedKey
     )
-    $path = Get-ExportLocationCachePath -Directory $Directory -TenantId $TenantId
+    $privateDirectory = New-FinOpsPrivateDirectory -Path $Directory
+    $path = Join-Path $privateDirectory "$ContextKey.json"
     $locations = @(foreach ($export in @($Exports | Where-Object { Test-ExportLocation $_ })) {
             $entry = [ordered]@{}
             foreach ($field in $script:ExportLocationFields) { $entry[$field] = $export.$field }
@@ -614,37 +612,44 @@ function Save-ExportLocationCache {
             $entry
         })
     $payload = [ordered]@{
-        version         = 1
-        tenantId        = ([guid]$TenantId).ToString('D')
+        version         = 2
+        contextKey      = $ContextKey
         discoveredUtc   = $DiscoveredUtc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         complete        = $Complete
-        subscriptionIds = @($SubscriptionIds | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object -Unique)
         lastUsed        = $LastUsedKey
         exports         = $locations
     }
-    $null = New-Item -ItemType Directory -Path $Directory -Force
     $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
-        [IO.File]::WriteAllText($temporary, ($payload | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
-        Move-Item -LiteralPath $temporary -Destination $path -Force
+        try {
+            $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 5))
+            $stream.Write($bytes, 0, $bytes.Length)
+        }
+        finally { $stream.Dispose() }
+        [IO.File]::Move($temporary, $path, $true)
     }
-    finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue } }
+    finally { [IO.File]::Delete($temporary) }
 }
 
 # Returns $null when there's nothing usable, so the caller simply searches again.
 function Read-ExportLocationCache {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$TenantId)
-    $path = Get-ExportLocationCachePath -Directory $Directory -TenantId $TenantId
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}\z')][string]$ContextKey)
+    if (-not [IO.Directory]::Exists($Directory)) { return $null }
+    $privateDirectory = New-FinOpsPrivateDirectory -Path $Directory
+    $path = Join-Path $privateDirectory "$ContextKey.json"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     $data = $null
     try { $data = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
     catch { Write-Verbose "Remembered export locations could not be read and will be ignored: $($_.Exception.Message)"; return $null }
-    if (-not $data -or $data.version -ne 1 -or [string]$data.tenantId -ne ([guid]$TenantId).ToString('D')) { return $null }
+    if (-not $data -or $data.version -ne 2 -or $data.contextKey -cne $ContextKey) { return $null }
     $exports = @(foreach ($location in @($data.exports | Where-Object { Test-ExportLocation $_ })) {
             $entry = [ordered]@{}
             foreach ($field in $script:ExportLocationFields) { $entry[$field] = $location.$field }
             $entry.Partitioned = [bool]$location.Partitioned
+            $entry.ScopeKind = 'Storage'
+            $entry.Type = 'Unknown'
             [pscustomobject]$entry
         })
     if ($exports.Count -eq 0) { return $null }
@@ -656,7 +661,6 @@ function Read-ExportLocationCache {
     }
     return [pscustomobject]@{
         Exports         = $exports
-        SubscriptionIds = @($data.subscriptionIds | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
         DiscoveredUtc   = if ($discovered) { $discovered.ToUniversalTime() } else { $null }
         Complete        = [bool]$data.complete
         LastUsedKey     = [string]$data.lastUsed
