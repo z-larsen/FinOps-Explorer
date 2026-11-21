@@ -322,7 +322,13 @@ function Select-CostExportData {
     $resolved = Resolve-ExportColumns -Header $ExportData.Rows[0].PSObject.Properties.Name
     $costColumn = $resolved.Cost
     if (-not $costColumn -or ($costColumn -ne 'BilledCost' -and $ExportData.CostBasis -ne 'ActualCost')) {
-        throw 'The export does not provide actual cost; BilledCost or an actual-cost dataset is required.'
+        $basis = [string]$ExportData.CostBasis
+        $reason = if (-not $costColumn) { 'it has no recognized cost column' }
+        elseif ($basis -eq 'Usage') { "it's a usage-only export, which leaves out purchases such as reservations and Marketplace, so totals would be understated" }
+        elseif ($basis -eq 'AmortizedCost') { 'it is an amortized cost export, which spreads purchases instead of showing what was billed' }
+        elseif (-not $basis -or $basis -eq 'Unknown') { 'its dataset type could not be confirmed: it was found in storage, and its newest run has no manifest.json that names the type' }
+        else { "its dataset type is $basis" }
+        throw "The export does not provide actual cost because $reason. Use a FOCUS export (BilledCost) or a 'Cost and usage details (actual)' export."
     }
     $expected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $requestedIds = if ($Subscriptions) { @($Subscriptions | ForEach-Object { $_.Id }) } else { @($ExportData.SelectedSubscriptionIds | Where-Object { $_ }) }
@@ -834,6 +840,7 @@ function Get-CostExportData {
     if (-not $manifestBlob -and $requiresManifest) {
         throw 'The export run has no manifest.json, so it might still be writing or be incomplete. No export data was read.'
     }
+    $manifestType = $null
     if ($manifestBlob) {
         $manifestEncoded = (($manifestBlob.Name -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/')
         $manifestBytes = Get-StorageBlobBytes -Uri "$blobBase/$container/$manifestEncoded" -StorageToken $token
@@ -841,6 +848,10 @@ function Get-CostExportData {
         $manifest = $null
         try { $manifest = [System.Text.Encoding]::UTF8.GetString($manifestBytes) | ConvertFrom-Json -ErrorAction Stop }
         catch { throw 'The export run manifest could not be parsed; cost coverage is incomplete.' }
+        # The run's own record of its dataset. It outranks the export definition, and it's
+        # the only reliable type for an export found by scanning storage.
+        if ($manifest.PSObject.Properties.Name -contains 'exportConfig' -and $manifest.exportConfig -and
+            [string]$manifest.exportConfig.type -match '^[A-Za-z]+$') { $manifestType = [string]$manifest.exportConfig.type }
         $declared = @($manifest.blobs)
         if ($declared.Count -eq 0) { throw 'The export run manifest lists no partitions; cost coverage is incomplete.' }
         $foundNames = [Collections.Generic.HashSet[string]]::new([string[]]@($runParts | ForEach-Object { [string]$_.Name }), [StringComparer]::Ordinal)
@@ -907,7 +918,7 @@ function Get-CostExportData {
         Headers      = $firstHeader
         NoCostColumn = ($colMap -and -not $colMap.Cost)
         NoData       = ($rows.Count -eq 0)
-        CostBasis    = if ($Export.ScopeKind -eq 'Storage') { 'Unknown' } else { $Export.Type }
+        CostBasis    = if ($manifestType) { $manifestType } elseif ($Export.ScopeKind -eq 'Storage') { 'Unknown' } else { $Export.Type }
     }
 }
 
