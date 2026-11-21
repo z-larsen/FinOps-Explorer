@@ -15,11 +15,34 @@ inventory, and optimization findings into a local report. It complements
 ongoing reporting in Cost Management, Power BI, and FinOps hubs; it doesn't
 replace their ingestion pipelines or monitor the environment between runs.
 
+- [What's new](#whats-new)
 - [Choose your cost data source](#choose-your-cost-data-source)
 - [Run a scan from start to finish](#run-a-scan-from-start-to-finish)
 - [Review and share the results](#review-and-share-the-results)
 - [Use FinOps Explorer with Fabric](#use-finops-explorer-with-fabric)
 - [Forecast pre-credit cost and workload growth](#forecast-pre-credit-cost-and-workload-growth)
+
+## What's new
+
+Updated November 20, 2026.
+
+- **Faster Idle VMs scans.** The scan reads Azure Monitor metrics for up to 50
+  VMs in one request, grouped by subscription and region, instead of one request
+  per VM. The batch read needs Monitoring Reader on the subscription and runs
+  only in the Azure public cloud. If a batch is denied, fails, or leaves out a
+  VM, Explorer reads those VMs one at a time, so coverage doesn't drop. In
+  sovereign clouds, it always reads them one at a time. Scans also hide the web
+  request progress bar that flickered over the scan status.
+- **Clearer export checks.** Explorer takes an export's dataset type from the
+  run's `manifest.json` first, then from the export definition. When an export
+  can't supply actual cost, the message now names the reason. See
+  [Start with a regular Cost Management export](#start-with-a-regular-cost-management-export).
+- **Remembered export locations.** Interactive runs remember where your exports
+  live and offer them again for the same cloud, tenant, account, and
+  subscriptions. Press Enter to pick the export you used last.
+- **Subscription totals stay in scope.** A report for selected subscriptions
+  says it excludes charges that have no subscription ID, without showing their
+  count or amount.
 
 ## Startup screen
 
@@ -50,6 +73,10 @@ entry-point script.
   starting point; billing, cost, storage export, and hub data can require
   additional permissions. See the
   [FinOps Explorer documentation](Private/FinOpsMultitool/README.md) for details.
+- Optional: **Monitoring Reader** on each subscription lets the Idle VMs scan
+  read Azure Monitor metrics in batches of up to 50 VMs in the Azure public
+  cloud. Without it, or in a sovereign cloud, the scan reads each VM
+  separately, which takes longer.
 - Network access to Azure and any data-source/dependency endpoints used by your
   selections. This is not an offline scanner.
 
@@ -115,7 +142,7 @@ replace Azure sign-in or the permissions needed by other scans.
 | --- | --- | --- |
 | FinOps hub with Azure Data Explorer or a compatible Microsoft Fabric KQL database | **FinOps Hub**, with the query endpoint and database configured when needed | Cost queries aggregate in the database and return summaries to PowerShell. |
 | Recognized FinOps hub with storage only | **FinOps Hub**, using the storage reader when no Kusto provider is selected | Reads supported Hub Parquet or CSV data into local memory. Use this path for small datasets. |
-| Regular Cost Management CSV/CSV.gz export in Azure Storage | **Cost Management exports (CSV storage)** or `-DataSource Export` | Discovers selected-scope definitions and export-like storage containers. Reads one chosen export, filters row subscriptions, and labels partial coverage. No Hub required. |
+| Regular Cost Management CSV/CSV.gz export in Azure Storage | **Cost Management exports (CSV storage)** or `-DataSource Export` | Discovers selected-scope definitions and export-like storage containers. Reads one chosen export, filters row subscriptions, and labels partial coverage. No Hub required. Needs an actual-cost or FOCUS export. Interactive runs remember the locations they find. |
 | Parquet exports or downloaded local files | Not supported by the ordinary CSV export source | Use a compatible FinOps hub for Parquet. `-OutputPath` is a report destination, not an input-file parameter. |
 | No hub, or you want to query Cost Management directly | **Cost Management API** or `-DataSource API` | Uses the Cost Management APIs for cost scans. Costs can lag usage, and API throttling can extend the run. |
 
@@ -125,6 +152,9 @@ Azure Monitor, Advisor, and Azure Policy. `Export` reads ActualCost or FOCUS
 BilledCost CSV data for cost totals, resource costs, cost by tag, and the months
 present in the selected run. Separate financial API scans are excluded, while
 inventory scans can still query Azure. Export failures never switch to live costs.
+Explorer takes the dataset type from the chosen run's `manifest.json` when it
+names one, and otherwise from the export definition. A usage-only or amortized
+export is rejected, and the message says why.
 There is no local input-file parameter; `-OutputPath` sets the report destination.
 
 To skip Hub detection and look for ordinary exports directly, run
@@ -294,25 +324,74 @@ forecast from Cost Management when access and matching currency allow it.
 
 ### Start with a regular Cost Management export
 
-An export in an ordinary storage container, or a downloaded CSV or Parquet file,
-isn't a selectable source in this TUI. Export-discovery helpers are packaged
-with the runtime, but the public launcher doesn't offer an export picker or
-accept a file, storage account, or container as an input.
+Use this path when Cost Management already writes CSV or CSV.gz exports to
+Azure Storage and you don't have a hub. The TUI reads the one export you
+choose. It doesn't create or run exports, read downloaded files, or parse
+Parquet.
 
-1. Check whether the export already feeds a FinOps hub. If it does, wait for the
-    required period to finish ingestion and use the matching Hub walkthrough above.
-2. If it doesn't, follow [Run an API scan](#run-an-api-scan) to assess the same
-    subscription. This queries Azure directly; it doesn't read or modify your
-    export, its schedule, or its destination.
-3. To reconcile the report with your export, compare the same subscription,
-    dates, currency, and cost basis. Billed and amortized costs aren't
-    interchangeable, and an earlier export might not contain the latest charges.
+1. Check whether the export already feeds a FinOps hub. If it does, wait for
+    ingestion to finish and use the matching Hub walkthrough above.
+2. Confirm that the export is a dataset the TUI accepts: **Cost and usage
+    details (actual)**, also called ActualCost, or a **FOCUS** export, which
+    supplies `BilledCost`. A **usage-only** export leaves out purchases such as
+    reservations and Marketplace, so its totals would be understated. An
+    **amortized** export spreads purchases instead of showing what was billed.
+    The TUI rejects both and says which one it found.
+3. Confirm access. Reading the export needs Storage Blob Data Reader or
+    equivalent on its storage and a network path to it, such as a firewall rule
+    or private endpoint. Discovery summarizes the locations your account can't
+    read instead of treating them as missing; use `-Verbose` for details.
+4. Start an interactive run so you can choose among exports. An unattended run
+    stops when it finds more than one readable export.
 
-If you only have storage access and can't query Cost Management, this TUI can't
-produce cost scans from those standalone files. Use an export-capable reporting
-tool, or have the hub owner onboard the data through the
-[documented FinOps hubs ingestion process](https://learn.microsoft.com/cloud-computing/finops/toolkit/hubs/deploy#configure-scopes-to-monitor).
-Renaming a container or adding a Hub tag doesn't configure that process.
+    ```powershell
+    Start-FinOpsExplorer -SubscriptionId $subscriptionId -DataSource Export -Scans $scanNames
+    ```
+
+5. Choose the export from the list. Each entry shows its name, format, dataset
+    type, and scope, with its storage path below. The label **not readable by
+    this source** marks Parquet and amortized exports. If you've searched before as
+    the same account in the same cloud and tenant with the same subscriptions,
+    the TUI offers the remembered locations first. Press Enter to use them, or
+    enter 2 to search again, which you need when an export moved or is new. If
+    one export is marked **last used**, press Enter again to pick it.
+6. Read the coverage note after the export loads. It gives the export period and
+    how many of your selected subscriptions returned rows. A subscription
+    without rows is unverified, not zero cost. Charges with no subscription ID,
+    such as purchases or refunds billed outside a subscription, aren't in
+    subscription totals, and the note says so without showing amounts.
+7. To reconcile the report with your export, compare the same subscription,
+    dates, currency, and cost basis. The report covers only the months in the
+    export's newest run, and an earlier run might not contain the latest charges.
+
+**Expected result:** Cost Data, Resource Costs, Cost by Tag, and Cost Trend use
+only the chosen export's rows for your selected subscriptions. Scans that need
+a separate financial API, such as Unit Economics, report that they aren't
+supported with an export. Inventory and metrics scans, such as Idle VMs, still
+query Azure. If the export can't be read, the cost scans report an error; the
+TUI never fills the gap with live Cost Management costs. CSV parts load into
+memory, so use a hub with Kusto for very large datasets.
+
+If the message says the export doesn't provide actual cost, it names one of
+these reasons:
+
+- **Usage-only.** The export leaves out purchases. Recreate it as **Cost and
+  usage details (actual)** or a FOCUS export.
+- **Amortized.** The export spreads purchases instead of showing what was
+  billed. Recreate it the same way.
+- **Type unconfirmed.** Neither the run's `manifest.json` nor an export
+  definition names the dataset type. This happens for an export found only in
+  storage, or restored from remembered locations, when its newest run has no
+  manifest type. Choose **Search again** so the TUI can read its definition, if
+  it has one, or use a FOCUS export, which doesn't need one.
+- **No cost column.** The CSV has no cost column the reader recognizes.
+
+For a Parquet export or a downloaded file, use a FinOps hub instead, or follow
+[Run an API scan](#run-an-api-scan) to assess the same subscription directly.
+See the
+[documented FinOps hubs ingestion process](https://learn.microsoft.com/cloud-computing/finops/toolkit/hubs/deploy#configure-scopes-to-monitor)
+to onboard export data. Renaming a container or adding a Hub tag doesn't
+configure that process.
 
 ### Run an API scan
 
@@ -600,6 +679,13 @@ standalone runtime on Windows; one Linux-only case was skipped. These cases
 use synthetic data and mocked service responses. Browser-event checks covered
 KPI search, status filters, source links, keyboard handlers, and narrow layouts;
 they don't establish live Azure data access.
+
+The November 2026 updates to the Idle VMs scan, the export reader, and remembered
+export locations were checked with unit tests that use synthetic data and mocked
+Azure responses, PSScriptAnalyzer, and the parity comparison against a local
+Toolkit checkout. Those tests aren't part of this snapshot, and none of these
+checks establish live Azure behavior. The batched metrics read applies only to
+the Azure public cloud.
 
 ### Keep the runtime in parity
 
