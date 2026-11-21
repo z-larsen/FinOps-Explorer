@@ -1543,6 +1543,11 @@ function Invoke-FinOpsMultitool {
         Write-FinOpsConsole "  $srcLabel" -ForegroundColor $srcColor
         Write-FinOpsConsole ""
 
+        # Web cmdlets draw a "Reading web response stream" bar for every request. Over
+        # hundreds of metric calls it flickers over the scan status and slows each call.
+        # Scoped to this function, so the caller's preference is untouched afterward.
+        $ProgressPreference = 'SilentlyContinue'
+
         foreach ($mod in $selected) {
             $current++
             $pct = [math]::Round(($current / $total) * 100)

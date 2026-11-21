@@ -13,6 +13,60 @@ param()
 #          CPU and network utilization that Advisor hasn't flagged yet.
 #          These are candidates for downsizing or shutting down.
 ###########################################################################
+# Notes:
+# - Metrics are read with the Azure Monitor metrics:getBatch API, up to 50
+#   VMs per call (same subscription and region). For 800 VMs that's about
+#   20 calls instead of 800.
+# - getBatch needs Monitoring Reader on the subscription, not just the VM,
+#   and only runs in the public cloud. Any batch that is denied or fails is
+#   retried one VM at a time with the per-resource metrics API, so coverage
+#   never drops below the per-VM path.
+###########################################################################
+
+# Turns one VM's metric list (the "value" array of a metrics response) into
+# measured CPU and network totals. Throws when a measurement is missing or
+# invalid, so the caller counts the VM as not evaluated instead of idle.
+function Get-IdleVmMeasurement {
+    param([AllowNull()][object[]]$Metrics)
+
+    $avgCpu = $null
+    $totalNetIn = 0
+    $totalNetOut = 0
+    $networkInSamples = 0
+    $networkOutSamples = 0
+
+    foreach ($metric in $Metrics) {
+        $metricName = $metric.name.value
+        if ($metric.PSObject.Properties.Name -contains 'errorCode' -and $metric.errorCode -and $metric.errorCode -ne 'Success') {
+            throw "Metric '$metricName' returned $($metric.errorCode)."
+        }
+        foreach ($ts in $metric.timeseries) {
+            foreach ($dp in $ts.data) {
+                switch ($metricName) {
+                    'Percentage CPU' {
+                        $avgCpu = Get-HubCostValue -Row $dp -Column 'average'
+                        if ($avgCpu -lt 0 -or $avgCpu -gt 100) { throw 'CPU measurement is outside the valid percentage range.' }
+                    }
+                    'Network In Total' {
+                        $networkValue = Get-HubCostValue -Row $dp -Column 'total'
+                        if ($networkValue -lt 0) { throw 'Network measurement cannot be negative.' }
+                        $totalNetIn += $networkValue
+                        $networkInSamples++
+                    }
+                    'Network Out Total' {
+                        $networkValue = Get-HubCostValue -Row $dp -Column 'total'
+                        if ($networkValue -lt 0) { throw 'Network measurement cannot be negative.' }
+                        $totalNetOut += $networkValue
+                        $networkOutSamples++
+                    }
+                }
+            }
+        }
+    }
+
+    if ($null -eq $avgCpu -or $networkInSamples -eq 0 -or $networkOutSamples -eq 0) { throw 'CPU or network measurements are missing; the VM was not evaluated.' }
+    [PSCustomObject]@{ AvgCpu = $avgCpu; TotalNetwork = $totalNetIn + $totalNetOut }
+}
 
 function Get-IdleVMs {
     [CmdletBinding()]
@@ -76,107 +130,126 @@ resources
         }
     }
 
-    # -- 2: Query 14-day avg CPU + Network for each VM -------------------
+    # -- 2: Read 14-day avg CPU + network for each VM --------------------
     $armBase = Get-FinOpsArmEndpoint
-    $token = Get-PlainAccessToken -ResourceUrl $armBase
-    $headers = @{ 'Authorization' = "Bearer $token"; 'Content-Type' = 'application/json' }
     $now = (Get-Date).ToUniversalTime()
     $fourteenDaysAgo = $now.AddDays(-14).ToString('yyyy-MM-ddTHH:mm:ssZ')
     $nowStr = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $batchStart = $now.AddDays(-14).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $batchEnd = $now.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $metricNames = 'Percentage CPU,Network In Total,Network Out Total'
 
     $cpuThreshold = 5    # avg CPU < 5% = idle
     $networkThreshold = 1048576  # < 1 MB/day total network = idle (14d * 1MB = 14MB)
     $networkThreshold14d = $networkThreshold * 14
 
     $vmCount = $runningVMs.Count
-    $vmIdx = 0
-    foreach ($vm in $runningVMs) {
-        $vmIdx++
-        if ($vmCount -gt 10 -and ($vmIdx -eq 1 -or $vmIdx % [math]::Max(1, [int]($vmCount / 10)) -eq 0)) {
-            if (Get-Command Update-ScanStatus -ErrorAction SilentlyContinue) {
-                Update-ScanStatus "Checking VM metrics ($vmIdx/$vmCount VMs)..."
-            }
+    $progress = @{ Done = 0; Next = 1; Step = [math]::Max(1, [int][math]::Ceiling($vmCount / 20)) }
+    $reportProgress = {
+        param([int]$Count)
+        $progress.Done += $Count
+        if ($vmCount -gt 10 -and $progress.Done -ge $progress.Next -and (Get-Command Update-ScanStatus -ErrorAction SilentlyContinue)) {
+            Update-ScanStatus "Checking VM metrics ($([math]::Min($progress.Done, $vmCount))/$vmCount VMs)..."
+            $progress.Next = $progress.Done + $progress.Step
         }
-        $scope = "/subscriptions/$($vm.subscriptionId)/resourceGroups/$($vm.resourceGroup)/providers/Microsoft.Compute/virtualMachines/$($vm.name)"
-        try {
-            # Query CPU + Network In + Network Out in a single call
-            # FULL is the only way to get one datapoint for the whole span:
-            # P14D is not a published timegrain and the API rejects it.
-            $metricUri = "$armBase$scope/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=Percentage CPU,Network In Total,Network Out Total&timespan=$fourteenDaysAgo/$nowStr&aggregation=Average,Total&interval=FULL"
-            $resp = Invoke-WebRequest -Uri $metricUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
-            $metricData = ($resp.Content | ConvertFrom-Json)
-
-            $avgCpu = $null
-            $totalNetIn = 0
-            $totalNetOut = 0
-            $networkInSamples = 0
-            $networkOutSamples = 0
-
-            foreach ($metric in $metricData.value) {
-                $metricName = $metric.name.value
-                foreach ($ts in $metric.timeseries) {
-                    foreach ($dp in $ts.data) {
-                        switch ($metricName) {
-                            'Percentage CPU' {
-                                $avgCpu = Get-HubCostValue -Row $dp -Column 'average'
-                                if ($avgCpu -lt 0 -or $avgCpu -gt 100) { throw 'CPU measurement is outside the valid percentage range.' }
-                            }
-                            'Network In Total' {
-                                $networkValue = Get-HubCostValue -Row $dp -Column 'total'
-                                if ($networkValue -lt 0) { throw 'Network measurement cannot be negative.' }
-                                $totalNetIn += $networkValue
-                                $networkInSamples++
-                            }
-                            'Network Out Total' {
-                                $networkValue = Get-HubCostValue -Row $dp -Column 'total'
-                                if ($networkValue -lt 0) { throw 'Network measurement cannot be negative.' }
-                                $totalNetOut += $networkValue
-                                $networkOutSamples++
-                            }
-                        }
-                    }
-                }
-            }
-
-            if ($null -eq $avgCpu -or $networkInSamples -eq 0 -or $networkOutSamples -eq 0) { throw 'CPU or network measurements are missing; the VM was not evaluated.' }
-            $totalNetwork = $totalNetIn + $totalNetOut
-
-            # Classify: idle if CPU < threshold AND network < threshold
-            $isIdle = $false
-            $classification = $null
-
-            if ($null -ne $avgCpu -and $avgCpu -lt $cpuThreshold -and $totalNetwork -lt $networkThreshold14d) {
-                $isIdle = $true
-                $classification = 'Idle'
-            }
-            elseif ($null -ne $avgCpu -and $avgCpu -lt 10 -and $totalNetwork -lt ($networkThreshold14d * 10)) {
-                $isIdle = $true
-                $classification = 'Underutilized'
-            }
-
-            if ($isIdle) {
-                $dailyNetMB = [math]::Round($totalNetwork / 14 / 1MB, 2)
-                [void]$results.Add([PSCustomObject]@{
-                        VMName         = $vm.name
-                        ResourceGroup  = $vm.resourceGroup
-                        SubscriptionId = $vm.subscriptionId
-                        Location       = $vm.location
-                        VMSize         = $vm.vmSize
-                        OS             = $vm.osType
-                        AvgCPU14d      = [math]::Round($avgCpu, 1)
-                        NetworkPerDay  = "$($dailyNetMB) MB"
-                        Classification = $classification
-                        Recommendation = if ($classification -eq 'Idle') { 'Deallocate or delete' } else { 'Downsize VM' }
-                    })
-            }
-        }
-        catch {
-            # A throttled or unauthorized metrics call is not the same as a busy VM,
-            # so count it rather than letting it read as "nothing to report".
-            [void]$metricFailures.Add("$($vm.name): $($_.Exception.Message)")
+    }
+    $vmScope = { param($Vm) "/subscriptions/$($Vm.subscriptionId)/resourceGroups/$($Vm.resourceGroup)/providers/Microsoft.Compute/virtualMachines/$($Vm.name)" }
+    $classifyVm = {
+        param($Vm, $Measurement)
+        $avgCpu = $Measurement.AvgCpu
+        $totalNetwork = $Measurement.TotalNetwork
+        $classification = if ($avgCpu -lt $cpuThreshold -and $totalNetwork -lt $networkThreshold14d) { 'Idle' }
+        elseif ($avgCpu -lt 10 -and $totalNetwork -lt ($networkThreshold14d * 10)) { 'Underutilized' }
+        else { $null }
+        if ($classification) {
+            $dailyNetMB = [math]::Round($totalNetwork / 14 / 1MB, 2)
+            [void]$results.Add([PSCustomObject]@{
+                    VMName         = $Vm.name
+                    ResourceGroup  = $Vm.resourceGroup
+                    SubscriptionId = $Vm.subscriptionId
+                    Location       = $Vm.location
+                    VMSize         = $Vm.vmSize
+                    OS             = $Vm.osType
+                    AvgCPU14d      = [math]::Round($avgCpu, 1)
+                    NetworkPerDay  = "$($dailyNetMB) MB"
+                    Classification = $classification
+                    Recommendation = if ($classification -eq 'Idle') { 'Deallocate or delete' } else { 'Downsize VM' }
+                })
         }
     }
 
+    # Batch reads: one call per 50 VMs that share a subscription and region.
+    $perVm = [System.Collections.Generic.List[object]]::new()
+    $batchToken = $null
+    if ($armBase -eq 'https://management.azure.com') {
+        try { $batchToken = Get-PlainAccessToken -ResourceUrl 'https://metrics.monitor.azure.com' }
+        catch { Write-Verbose "    Batch metrics token unavailable; reading VMs one at a time. $($_.Exception.Message)" }
+    }
+    if ($batchToken) {
+        $batchHeaders = @{ 'Authorization' = "Bearer $batchToken" }
+        $groups = $runningVMs | Group-Object { "$($_.subscriptionId)|$(([string]$_.location).ToLowerInvariant())" }
+        foreach ($group in $groups) {
+            $subscriptionId, $region = $group.Name -split '\|', 2
+            $members = @($group.Group)
+            if ($region -notmatch '^[a-z0-9]+$' -or $subscriptionId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+                foreach ($vm in $members) { $perVm.Add($vm) }
+                continue
+            }
+            for ($offset = 0; $offset -lt $members.Count; $offset += 50) {
+                $chunk = @($members[$offset..([math]::Min($offset + 49, $members.Count - 1))])
+                $ids = @($chunk | ForEach-Object { & $vmScope $_ })
+                $deferred = 0
+                try {
+                    $batchUri = "https://$region.metrics.monitor.azure.com/subscriptions/$subscriptionId/metrics:getBatch?api-version=2023-10-01&metricnamespace=Microsoft.Compute/virtualMachines&metricnames=$metricNames&starttime=$batchStart&endtime=$batchEnd&aggregation=average,total&interval=FULL"
+                    $body = @{ resourceids = $ids } | ConvertTo-Json -Depth 3 -Compress
+                    $resp = Invoke-WebRequest -Uri $batchUri -Headers $batchHeaders -Method Post -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 60 -MaximumRedirection 0 -ErrorAction Stop
+                    $byId = @{}
+                    foreach ($entry in @(($resp.Content | ConvertFrom-Json).values)) {
+                        if ($entry -and $entry.resourceid) { $byId[([string]$entry.resourceid).ToLowerInvariant()] = $entry }
+                    }
+                    for ($n = 0; $n -lt $chunk.Count; $n++) {
+                        $entry = $byId[$ids[$n].ToLowerInvariant()]
+                        # A VM the batch didn't answer for gets its own call rather than a guess.
+                        if (-not $entry) { $perVm.Add($chunk[$n]); $deferred++; continue }
+                        try { & $classifyVm $chunk[$n] (Get-IdleVmMeasurement -Metrics $entry.value) }
+                        catch { [void]$metricFailures.Add("$($chunk[$n].name): $($_.Exception.Message)") }
+                    }
+                }
+                catch {
+                    Write-Verbose "    Batch metrics read failed for $($chunk.Count) VM(s) in $region; reading them one at a time. $($_.Exception.Message)"
+                    foreach ($vm in $chunk) { $perVm.Add($vm) }
+                    $deferred = $chunk.Count
+                }
+                & $reportProgress ($chunk.Count - $deferred)
+            }
+        }
+    }
+    else {
+        foreach ($vm in $runningVMs) { $perVm.Add($vm) }
+    }
+
+    # Per-VM reads: sovereign clouds, missing subscription-level Monitoring Reader,
+    # or anything a batch didn't answer.
+    if ($perVm.Count -gt 0) {
+        $token = Get-PlainAccessToken -ResourceUrl $armBase
+        $headers = @{ 'Authorization' = "Bearer $token"; 'Content-Type' = 'application/json' }
+        foreach ($vm in $perVm) {
+            $scope = & $vmScope $vm
+            try {
+                # FULL is the only way to get one datapoint for the whole span:
+                # P14D is not a published timegrain and the API rejects it.
+                $metricUri = "$armBase$scope/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=$metricNames&timespan=$fourteenDaysAgo/$nowStr&aggregation=Average,Total&interval=FULL"
+                $resp = Invoke-WebRequest -Uri $metricUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
+                & $classifyVm $vm (Get-IdleVmMeasurement -Metrics ($resp.Content | ConvertFrom-Json).value)
+            }
+            catch {
+                # A throttled or unauthorized metrics call is not the same as a busy VM,
+                # so count it rather than letting it read as "nothing to report".
+                [void]$metricFailures.Add("$($vm.name): $($_.Exception.Message)")
+            }
+            & $reportProgress 1
+        }
+    }
     if ($metricFailures.Count -gt 0) {
         Write-Warning "    Metrics unavailable for $($metricFailures.Count) of $($runningVMs.Count) VM(s); those VMs were not evaluated."
         foreach ($f in ($metricFailures | Select-Object -First 3)) { Write-Verbose "      $f" }
