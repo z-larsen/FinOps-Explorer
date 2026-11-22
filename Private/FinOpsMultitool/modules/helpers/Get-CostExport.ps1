@@ -555,10 +555,14 @@ function Find-CostExport {
 # -- Remembered export locations -----------------------------------------
 # A remembered location isn't a current export definition.
 $script:ExportLocationFields = @('Name', 'Format', 'Partitioned', 'StorageResourceId', 'Container', 'RootFolder')
+# Version 3 keeps the root folder and export name case-sensitive in lastUsed. Earlier
+# files stored that key lowercased, so they could point at a different export and aren't reused.
+$script:ExportLocationCacheVersion = 3
 
 function Get-ExportLocationKey {
+    # Resource IDs and container names are case-insensitive; blob folder and export names aren't.
     param([Parameter(Mandatory)][object]$Export)
-    return "$($Export.StorageResourceId)|$($Export.Container)|$(([string]$Export.RootFolder).Trim('/'))|$($Export.Name)".ToLowerInvariant()
+    return "$(([string]$Export.StorageResourceId).ToLowerInvariant())|$(([string]$Export.Container).ToLowerInvariant())|$(([string]$Export.RootFolder).Trim('/'))|$($Export.Name)"
 }
 
 function Get-ExportLocationContextKey {
@@ -609,10 +613,11 @@ function Save-ExportLocationCache {
             $entry = [ordered]@{}
             foreach ($field in $script:ExportLocationFields) { $entry[$field] = $export.$field }
             $entry.Partitioned = [bool]$export.Partitioned
+            $entry.FromEarlierSearch = [bool]$export.FromEarlierSearch
             $entry
         })
     $payload = [ordered]@{
-        version         = 2
+        version         = $script:ExportLocationCacheVersion
         contextKey      = $ContextKey
         discoveredUtc   = $DiscoveredUtc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         complete        = $Complete
@@ -643,11 +648,12 @@ function Read-ExportLocationCache {
     $data = $null
     try { $data = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
     catch { Write-Verbose "Remembered export locations could not be read and will be ignored: $($_.Exception.Message)"; return $null }
-    if (-not $data -or $data.version -ne 2 -or $data.contextKey -cne $ContextKey) { return $null }
+    if (-not $data -or $data.version -ne $script:ExportLocationCacheVersion -or $data.contextKey -cne $ContextKey) { return $null }
     $exports = @(foreach ($location in @($data.exports | Where-Object { Test-ExportLocation $_ })) {
             $entry = [ordered]@{}
             foreach ($field in $script:ExportLocationFields) { $entry[$field] = $location.$field }
             $entry.Partitioned = [bool]$location.Partitioned
+            $entry.FromEarlierSearch = $location.FromEarlierSearch -eq $true
             $entry.ScopeKind = 'Storage'
             $entry.Type = 'Unknown'
             [pscustomobject]$entry
@@ -713,20 +719,23 @@ function Get-ExportStorageCandidates {
 # only delegates subscription scope. The definition is invisible, but the
 # blobs land in a storage account we can read. Reconstruct those exports from
 # the blob layout so the export fast path still works. Deduped against
-# control-plane results via -KnownKeys.
+# control-plane results via -KnownKeys: a hashtable keyed by location, or a set of
+# location keys. Keys compare ordinally because blob folder and export names are case-sensitive.
 function Find-CostExportFromStorage {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object[]]$Subscriptions,
         [string]$Environment = 'AzureCloud',
-        [hashtable]$KnownKeys,
+        [object]$KnownKeys,
         [object[]]$StorageAccounts
     )
 
-    if (-not $KnownKeys) { $KnownKeys = @{} }
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $knownSource = if ($KnownKeys -is [Collections.IDictionary]) { $KnownKeys.Keys } else { $KnownKeys }
+    foreach ($key in @($knownSource)) { if ($key) { [void]$known.Add([string]$key) } }
     $suffix = Get-ExportBlobSuffix -Environment $Environment
     $found  = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen   = @{}
+    $seen   = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
     $token = $null
 
@@ -791,7 +800,7 @@ function Find-CostExportFromStorage {
             }
         }
         $knownContainers = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($key in $KnownKeys.Keys) {
+        foreach ($key in $known) {
             $parts = [string]$key -split '\|', 4
             if ($parts.Count -ge 2 -and $parts[0] -eq $sa.ResourceId) { [void]$knownContainers.Add($parts[1]) }
         }
@@ -821,7 +830,7 @@ function Find-CostExportFromStorage {
             # Group CSV parts by their export folder = path before the
             # {dateRange} (YYYYMMDD-YYYYMMDD) token. The segment just before the
             # date range is the export Name; everything earlier is the RootFolder.
-            $groups = @{}
+            $groups = [Collections.Generic.Dictionary[string, Collections.Generic.List[PSCustomObject]]]::new([StringComparer]::Ordinal)
             foreach ($b in $csvBlobs) {
                 $m = [regex]::Match($b.Name, '^(?<folder>.*?)/(?<range>\d{8}-\d{8})/')
                 if (-not $m.Success) {
@@ -842,19 +851,18 @@ function Find-CostExportFromStorage {
                 $name = $segs[-1]
                 $root = if ($segs.Count -gt 1) { ($segs[0..($segs.Count - 2)] -join '/') } else { '' }
 
-                $key = ("$($sa.ResourceId)|$container|$root|$name").ToLowerInvariant()
-                if ($KnownKeys.ContainsKey($key) -or $seen.ContainsKey($key)) { continue }
-                $seen[$key] = $true
+                $key = "$(([string]$sa.ResourceId).ToLowerInvariant())|$container|$root|$name"
+                if ($known.Contains($key) -or -not $seen.Add($key)) { continue }
 
                 $parts   = $groups[$folder]
                 $lastRun = ($parts | ForEach-Object { $_.LastModified } | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1)
                 $partitioned = (@($parts | Where-Object { $_.Name -match '/part_\d+(?:_\d+)?\.csv(?:\.gz)?$' }).Count -gt 1)
 
-                # Infer the cost type from the folder name (best-effort, display only)
+                # Display only: the run's manifest decides the type when the export is read.
                 $type = if ($name -match 'amortiz') { 'AmortizedCost' }
                 elseif ($name -match 'actual') { 'ActualCost' }
                 elseif ($name -match 'focus') { 'FocusCost' }
-                else { 'Usage' }
+                else { 'Unknown' }
 
                 [void]$found.Add([PSCustomObject]@{
                         Name              = $name

@@ -216,4 +216,25 @@ Describe 'Forecast console' {
         $inputs.otherCharges[0].amount | Should -Be '-50'
         @(InModuleScope FinOpsForecast -Parameters @{ Root = $root } { Get-ForecastVintages -Root $Root }).Count | Should -Be 1
     }
+
+    It 'Offers an export once when its definition and storage folder match, and keeps a folder that differs only in letter case' {
+        $storage = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/fixture/providers/Microsoft.Storage/storageAccounts/examplestorage'
+        Mock Get-AzContext -ModuleName FinOpsForecast { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' } } }
+        Mock Find-CostExport -ModuleName FinOpsForecast {
+            [pscustomobject]@{ Name = 'Daily'; Type = 'ActualCost'; Format = 'Csv'; ScopeKind = 'Subscription'; ScopeLabel = 'Example'; StorageResourceId = $storage; Container = 'exports'; RootFolder = 'Finance' }
+        }
+        Mock Get-ExportStorageCandidates -ModuleName FinOpsMultitool { [pscustomobject]@{ Name = 'examplestorage'; ResourceId = $storage; SubId = '11111111-1111-1111-1111-111111111111' } }
+        Mock Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool { [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ name = 'exports' }) } | ConvertTo-Json -Depth 5) } }
+        Mock Get-PlainAccessToken -ModuleName FinOpsMultitool { 'synthetic-token' }
+        Mock Get-StorageBlobList -ModuleName FinOpsMultitool {
+            @{ Listed = $true; Blobs = @(
+                    [pscustomobject]@{ Name = 'Finance/Daily/20260901-20260930/run/part_0_0001.csv'; LastModified = [datetime]'2026-10-01' }
+                    [pscustomobject]@{ Name = 'finance/daily/20260901-20260930/run/part_0_0001.csv'; LastModified = [datetime]'2026-10-01' }
+                )
+            }
+        }
+        Set-TestAnswers @('1,2,3')
+        $sources = InModuleScope FinOpsForecast { Select-ForecastDiscoveredSources -Subscriptions @([pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'Example'; TenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }) }
+        (@($sources).prefix -join '|') | Should -BeExactly 'Finance/Daily|finance/daily'
+    }
 }

@@ -24,7 +24,7 @@ replace their ingestion pipelines or monitor the environment between runs.
 
 ## What's new
 
-Updated November 20, 2026.
+Updated November 21, 2026.
 
 - **Faster Idle VMs scans.** The scan reads Azure Monitor metrics for up to 50
   VMs in one request, grouped by subscription and region, instead of one request
@@ -39,7 +39,14 @@ Updated November 20, 2026.
   [Start with a regular Cost Management export](#start-with-a-regular-cost-management-export).
 - **Remembered export locations.** Interactive runs remember where your exports
   live and offer them again for the same cloud, tenant, account, and
-  subscriptions. Press Enter to pick the export you used last.
+  subscriptions. Press Enter to pick the export you used last. A search that
+  can't check everything no longer drops locations an earlier search found.
+- **Scan one storage account by name.** With more than 100 storage accounts,
+  type the name of the one that holds your exports instead of scanning them
+  all. Explorer still reads export definitions first.
+- **No more guessed export types.** An export found only in storage whose
+  folder name doesn't show its type is listed as **type checked when read**,
+  not as usage-only.
 - **Subscription totals stay in scope.** A report for selected subscriptions
   says it excludes charges that have no subscription ID, without showing their
   count or amount.
@@ -349,12 +356,21 @@ Parquet.
     ```
 
 5. Choose the export from the list. Each entry shows its name, format, dataset
-    type, and scope, with its storage path below. The label **not readable by
-    this source** marks Parquet and amortized exports. If you've searched before as
+    type, and scope, with its storage path below. **Type checked when read**
+    means the type comes from the export run when you choose it. The label
+    **not readable by this source** marks Parquet and amortized exports. If you've searched before as
     the same account in the same cloud and tenant with the same subscriptions,
     the TUI offers the remembered locations first. Press Enter to use them, or
     enter 2 to search again, which you need when an export moved or is new. If
-    one export is marked **last used**, press Enter again to pick it.
+    one export is marked **last used**, press Enter again to pick it. When a new
+    search can't check everything, locations an earlier search found stay in
+    the list, marked **from an earlier search**.
+    With more than 100 storage accounts in the selected subscriptions, the TUI
+    asks before scanning them all, because Azure allows 100 container listings
+    per 5 minutes in each subscription and region. If you know which storage
+    account holds your exports, type its name to scan only that one. Enter Y to
+    scan them all, or N to skip the storage scan.
+
 6. Read the coverage note after the export loads. It gives the export period and
     how many of your selected subscriptions returned rows. A subscription
     without rows is unverified, not zero cost. Charges with no subscription ID,
@@ -608,7 +624,7 @@ you pass a name, with its settings, review decisions, cached history, and saved
 forecasts. The temporary download links for live Cost Management reports are
 never written to the console, the workspace, or any report.
 Interactive export searches save locations under `FinOpsToolkit\Explorer\ExportLocations`,
-not cost data, keys, or tokens. Explorer ignores older tenant-only files.
+not cost data, keys, or tokens. Explorer ignores files saved by earlier versions.
 Delete the folder to forget all saved locations.
 
 Reports can include tenant/subscription identifiers, resource names, tags,
