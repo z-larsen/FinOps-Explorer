@@ -44,6 +44,10 @@ Updated November 21, 2026.
 - **Scan one storage account by name.** With more than 100 storage accounts,
   type the name of the one that holds your exports instead of scanning them
   all. Explorer still reads export definitions first.
+- **Live API scans with exports.** When you choose a CSV export, the 15 scans it
+  supports are selected by default. The other 11, such as budgets and
+  commitments, are marked **(live API)** in the menu; select them to gather that
+  context live. The report labels each one.
 - **No more guessed export types.** An export found only in storage whose
   folder name doesn't show its type is listed as **type checked when read**,
   not as usage-only.
@@ -157,8 +161,11 @@ replace Azure sign-in or the permissions needed by other scans.
 cost-dependent scans, but remaining scans can still call services such as
 Azure Monitor, Advisor, and Azure Policy. `Export` reads ActualCost or FOCUS
 BilledCost CSV data for cost totals, resource costs, cost by tag, and the months
-present in the selected run. Separate financial API scans are excluded, while
-inventory scans can still query Azure. Export failures never switch to live costs.
+present in the selected run. Inventory and metrics scans still query Azure.
+Scans that need Cost Management or billing APIs, such as budgets, commitments,
+anomalies, and contract details, appear in the scan menu marked **(live API)**
+and are off by default. Select them to gather that context live alongside the
+export; the report labels each one. Export failures never switch to live costs.
 Explorer takes the dataset type from the chosen run's `manifest.json` when it
 names one, and otherwise from the export definition. A usage-only or amortized
 export is rejected, and the message says why.
@@ -355,6 +362,12 @@ Parquet.
     Start-FinOpsExplorer -SubscriptionId $subscriptionId -DataSource Export -Scans $scanNames
     ```
 
+    With more than 100 storage accounts in the selected subscriptions, the TUI
+    asks before scanning them all, because Azure allows 100 container listings
+    per 5 minutes in each subscription and region. If you know which storage
+    account holds your exports, type its name to scan only that one. Enter Y to
+    scan them all, or N to skip the storage scan.
+
 5. Choose the export from the list. Each entry shows its name, format, dataset
     type, and scope, with its storage path below. **Type checked when read**
     means the type comes from the export run when you choose it. The label
@@ -365,12 +378,6 @@ Parquet.
     one export is marked **last used**, press Enter again to pick it. When a new
     search can't check everything, locations an earlier search found stay in
     the list, marked **from an earlier search**.
-    With more than 100 storage accounts in the selected subscriptions, the TUI
-    asks before scanning them all, because Azure allows 100 container listings
-    per 5 minutes in each subscription and region. If you know which storage
-    account holds your exports, type its name to scan only that one. Enter Y to
-    scan them all, or N to skip the storage scan.
-
 6. Read the coverage note after the export loads. It gives the export period and
     how many of your selected subscriptions returned rows. A subscription
     without rows is unverified, not zero cost. Charges with no subscription ID,
@@ -381,11 +388,14 @@ Parquet.
     export's newest run, and an earlier run might not contain the latest charges.
 
 **Expected result:** Cost Data, Resource Costs, Cost by Tag, and Cost Trend use
-only the chosen export's rows for your selected subscriptions. Scans that need
-a separate financial API, such as Unit Economics, report that they aren't
-supported with an export. Inventory and metrics scans, such as Idle VMs, still
-query Azure. If the export can't be read, the cost scans report an error; the
-TUI never fills the gap with live Cost Management costs. CSV parts load into
+only the chosen export's rows for your selected subscriptions. Inventory and
+metrics scans, such as Idle VMs, still query Azure. The 11 scans that need
+Cost Management or billing APIs, such as Budget Status and Reservation Advice,
+are marked **(live API)** and off by default. Select them in the menu, or name
+them in `-Scans`, to run them live. `-Scans All` keeps the export default. The
+report marks each live scan, and the cost-source line lists them. If the export
+can't be read, the cost scans report an error; the TUI never fills the gap with
+live Cost Management costs. CSV parts load into
 memory, so use a hub with Kusto for very large datasets.
 
 If the message says the export doesn't provide actual cost, it names one of

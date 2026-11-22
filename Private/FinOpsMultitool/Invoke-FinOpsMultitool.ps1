@@ -1223,7 +1223,8 @@ function Invoke-FinOpsMultitool {
         Write-FinOpsConsole ""
         for ($i = 0; $i -lt $Modules.Count; $i++) {
             $mark = if ($Modules[$i].Selected) { 'x' } else { ' ' }
-            Write-FinOpsConsole ("    [{0,2}] [{1}] {2}  ({3})" -f ($i + 1), $mark, $Modules[$i].Name, $Modules[$i].Category)
+            $label = if ($Modules[$i].LiveApi) { "$($Modules[$i].Name) (live API)" } else { $Modules[$i].Name }
+            Write-FinOpsConsole ("    [{0,2}] [{1}] {2}  ({3})" -f ($i + 1), $mark, $label, $Modules[$i].Category)
         }
         Write-FinOpsConsole ""
         Write-FinOpsConsole "  Enter numbers separated by commas, 'all', or blank to keep the [x] defaults." -ForegroundColor DarkGray
@@ -1280,7 +1281,7 @@ function Invoke-FinOpsMultitool {
                 foreach ($mod in $catModules) {
                     $idx = [array]::IndexOf($Modules, $mod)
                     $check = if ($mod.Selected) { '[x]' } else { '[ ]' }
-                    $lines += "     $check $($mod.Name)"
+                    $lines += "     $check $($mod.Name)$(if ($mod.LiveApi) { ' (live API)' })"
                     $lineToIndex[$lines.Count - 1] = $idx
                 }
                 $lines += ''
@@ -1324,7 +1325,7 @@ function Invoke-FinOpsMultitool {
                     elseif ($isActive) { 'White' }
                     elseif ($mod.Selected) { 'DarkGreen' }
                     else { 'Gray' }
-                    Write-FinOpsConsole "  $pointer $check $($mod.Name)" -ForegroundColor $color
+                    Write-FinOpsConsole "  $pointer $check $($mod.Name)$(if ($mod.LiveApi) { ' (live API)' })" -ForegroundColor $color
                 }
             }
 
@@ -1581,30 +1582,36 @@ function Invoke-FinOpsMultitool {
             foreach ($scan in $exportScans) {
                 $permissionInfo[$scan] = @{ Role = 'Storage Blob Data Reader'; Scope = 'Selected export container'; API = 'Azure Storage data API'; Reason = 'Export scans require the selected destination to be readable. Failed reads do not switch to live Cost Management queries.' }
             }
-            try {
-                $rawExport = Get-CostExportData -Export $DataSource.Export -Environment $DataSource.Environment
-                $exportData = Select-CostExportData -ExportData $rawExport -Subscriptions $Subscriptions -SkipCoverageCheck
-                if (-not $exportData.Rows.Count) { throw 'No cost rows match the selected subscriptions.' }
-                $exportSubscriptions = @($Subscriptions | Where-Object { $_.Id -in $exportData.CoveredSubscriptionIds })
-                $missingIds = @($Subscriptions.Id | Where-Object { $_ -notin $exportData.CoveredSubscriptionIds })
-                $unattributedNote = ''
-                if ($exportData.ExcludedUnscopedCharges) {
-                    $unattributedNote = ' These totals exclude charges without a subscription ID.'
-                }
-                $exportCoverage = [pscustomobject]@{
-                    Name = $DataSource.Export.Name; CoverageIncomplete = ($missingIds.Count -gt 0)
-                    CoveredSubscriptionIds = @($exportData.CoveredSubscriptionIds); UnverifiedSubscriptionIds = $missingIds
-                    TotalSubs = $Subscriptions.Count; ScannedSubs = $exportSubscriptions.Count
-                    ExcludedUnscopedCharges = $exportData.ExcludedUnscopedCharges
-                    ActualPeriod = $exportData.ActualPeriod; DataDate = $exportData.DataDate
-                    Note = "Export rows cover $($exportSubscriptions.Count) of $($Subscriptions.Count) selected subscriptions. Subscriptions without returned rows are unverified, not zero cost. Export period: $($exportData.ActualPeriod).$unattributedNote"
-                }
-                $results['_source_Export'] = $exportCoverage
-                $DataSource.CoverageNote = $exportCoverage.Note
-                Write-FinOpsConsole "  Export loaded: $($exportData.RowCount) selected-scope rows; period $($exportData.ActualPeriod)." -ForegroundColor Green
-                Write-FinOpsConsole "  $($exportCoverage.Note)" -ForegroundColor $(if ($missingIds.Count -or $exportData.ExcludedUnscopedCharges) { 'Yellow' } else { 'DarkGray' })
+            if (-not @($selected | Where-Object { $_.Fn -in $exportScans }).Count) {
+                # Only live API, inventory, or metrics scans are selected, so the CSV parts aren't downloaded.
+                $DataSource.CoverageNote = 'No selected scan reads the export, so it wasn''t downloaded.'
             }
-            catch { $exportIssue = "Selected export data is unavailable or incomplete: $($_.Exception.Message)" }
+            else {
+                try {
+                    $rawExport = Get-CostExportData -Export $DataSource.Export -Environment $DataSource.Environment
+                    $exportData = Select-CostExportData -ExportData $rawExport -Subscriptions $Subscriptions -SkipCoverageCheck
+                    if (-not $exportData.Rows.Count) { throw 'No cost rows match the selected subscriptions.' }
+                    $exportSubscriptions = @($Subscriptions | Where-Object { $_.Id -in $exportData.CoveredSubscriptionIds })
+                    $missingIds = @($Subscriptions.Id | Where-Object { $_ -notin $exportData.CoveredSubscriptionIds })
+                    $unattributedNote = ''
+                    if ($exportData.ExcludedUnscopedCharges) {
+                        $unattributedNote = ' These totals exclude charges without a subscription ID.'
+                    }
+                    $exportCoverage = [pscustomobject]@{
+                        Name = $DataSource.Export.Name; CoverageIncomplete = ($missingIds.Count -gt 0)
+                        CoveredSubscriptionIds = @($exportData.CoveredSubscriptionIds); UnverifiedSubscriptionIds = $missingIds
+                        TotalSubs = $Subscriptions.Count; ScannedSubs = $exportSubscriptions.Count
+                        ExcludedUnscopedCharges = $exportData.ExcludedUnscopedCharges
+                        ActualPeriod = $exportData.ActualPeriod; DataDate = $exportData.DataDate
+                        Note = "Export rows cover $($exportSubscriptions.Count) of $($Subscriptions.Count) selected subscriptions. Subscriptions without returned rows are unverified, not zero cost. Export period: $($exportData.ActualPeriod).$unattributedNote"
+                    }
+                    $results['_source_Export'] = $exportCoverage
+                    $DataSource.CoverageNote = $exportCoverage.Note
+                    Write-FinOpsConsole "  Export loaded: $($exportData.RowCount) selected-scope rows; period $($exportData.ActualPeriod)." -ForegroundColor Green
+                    Write-FinOpsConsole "  $($exportCoverage.Note)" -ForegroundColor $(if ($missingIds.Count -or $exportData.ExcludedUnscopedCharges) { 'Yellow' } else { 'DarkGray' })
+                }
+                catch { $exportIssue = "Selected export data is unavailable or incomplete: $($_.Exception.Message)" }
+            }
         }
 
         $srcLabel = switch ($DataSource.Source) {
@@ -1628,14 +1635,15 @@ function Invoke-FinOpsMultitool {
             $pct = [math]::Round(($current / $total) * 100)
             $bar = ('█' * [math]::Floor($pct / 5)).PadRight(20, '░')
 
-            Write-FinOpsConsole "  [$bar] $pct%  ($current/$total) $($mod.Name)" -ForegroundColor White
+            $liveTag = if ($DataSource.Source -eq 'Export' -and $mod.LiveApi) { ' (live API)' } else { '' }
+            Write-FinOpsConsole "  [$bar] $pct%  ($current/$total) $($mod.Name)$liveTag" -ForegroundColor White
 
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             try {
                 $fn = $mod.Fn
                 $output = $null
                 if ($hubScanErrors.ContainsKey($fn)) { throw $hubScanErrors[$fn] }
-                if ($DataSource.Source -eq 'Export' -and $fn -in @('Get-AIWorkloadMetrics', 'Get-UnitEconomics', 'Get-SavingsRealized', 'Get-BudgetHistory', 'Get-BudgetStatus', 'Get-CommitmentUtilization', 'Get-ReservationAdvice', 'Get-AnomalyAlerts', 'Get-BillingStructure', 'Get-ContractInfo', 'Get-MaccCommitment', 'Get-VmCostBreakdown', 'Get-SharedCostAllocation', 'Get-UsageProportionalAllocation')) {
+                if ($DataSource.Source -eq 'Export' -and -not $mod.LiveApi -and $fn -in @('Get-AIWorkloadMetrics', 'Get-UnitEconomics', 'Get-SavingsRealized', 'Get-BudgetHistory', 'Get-BudgetStatus', 'Get-CommitmentUtilization', 'Get-ReservationAdvice', 'Get-AnomalyAlerts', 'Get-BillingStructure', 'Get-ContractInfo', 'Get-MaccCommitment', 'Get-VmCostBreakdown', 'Get-SharedCostAllocation', 'Get-UsageProportionalAllocation')) {
                     throw "$($mod.Name) is not supported by the selected CSV export source. Select API or a supported Hub source explicitly for a separate scan; no live cost fallback was attempted."
                 }
 
@@ -1730,8 +1738,9 @@ function Invoke-FinOpsMultitool {
                         }
                         if ($budgetRows.Count -gt 0) {
                             # Reuse Cost Trend's already-fetched monthly spend so we don't
-                            # re-hit the throttle-prone Cost Management Query API.
-                            $trendResult = if ($results.ContainsKey('Get-CostTrend')) { $results['Get-CostTrend'] } else { $null }
+                            # re-hit the throttle-prone Cost Management Query API. In Export
+                            # mode that trend is the export's, so the live scan reads its own.
+                            $trendResult = if ($DataSource.Source -ne 'Export' -and $results.ContainsKey('Get-CostTrend')) { $results['Get-CostTrend'] } else { $null }
                             $output = & $fn -Budgets $budgetRows -MonthsBack 6 -CostTrend $trendResult
                             if ($budgetResult.CoverageIncomplete) {
                                 $coverageNote = "Budget history covers only the available budget definitions. $($budgetResult.Note)".TrimEnd()
@@ -3784,6 +3793,7 @@ h2[id] { scroll-margin-top: 85px; }
                         $notes += [string]$Results['_source_Export'].Note
                         if ($Results['_source_Export'].CoverageIncomplete) { $state = 'Limited data' }
                     }
+                    if ($selectedMod.LiveApi) { $notes += 'Live API scan: read from Cost Management or billing APIs, not from the selected export.' }
                     if ($state -ne 'Failed' -and ($scanData.CoverageIncomplete -contains $true -or $scanData.ComplianceCoverageIncomplete -contains $true -or $scanData.DefinitionCoverageIncomplete -contains $true -or $scanData.AccessDenied -contains $true -or
                             @(@($scanData.CostIssue; $scanData.RateIssue; $scanData.AHBIssue; $scanData.Error) | Where-Object { $_ }).Count -gt 0 -or
                             @($scanData.MetricFailures | Where-Object { $_ -gt 0 }).Count -gt 0 -or
@@ -5012,7 +5022,8 @@ h2[id] { scroll-margin-top: 85px; }
                     @($summaryData.MetricFailures | Where-Object { $_ -gt 0 }).Count -gt 0) { "Limited data: $(if ($summaryNote) { $summaryNote } else { 'Some evidence could not be verified.' })" }
                 elseif ($count -eq 0) { 'No data' }
                 else { 'Result returned' }
-                $summaryLines += "$($mod.Name): $status"
+                $summaryName = if ($mod.LiveApi) { "$($mod.Name) (live API)" } else { $mod.Name }
+                $summaryLines += "${summaryName}: $status"
             }
             Write-FinOpsReportFile -Directory $exportDir -Name 'ScanSummary.txt' -Lines $summaryLines -ErrorAction Stop
 
@@ -5081,14 +5092,17 @@ h2[id] { scroll-margin-top: 85px; }
         }
     }
     if ($sourceChoice.Source -eq 'Export') {
-        $unsupportedExportScans = @($costModuleFns | Where-Object { $_ -notin @('Get-CostData', 'Get-ResourceCosts', 'Get-CostByTag', 'Get-CostTrend') })
-        if ($Scans -and $Scans -notcontains 'All') {
-            $requestedUnsupported = @($scanModules | Where-Object { $_.Selected -and $_.Fn -in $unsupportedExportScans })
-            if ($requestedUnsupported.Count) { throw "The requested scan(s) are not supported by the CSV export source: $($requestedUnsupported.Fn -join ', '). Select API or Hub explicitly for those scans." }
+        # Scans the export can't answer stay available as live API scans: off by
+        # default, and selected only when the menu or a named -Scans list asks for them.
+        $liveApiScans = @($costModuleFns | Where-Object { $_ -notin @('Get-CostData', 'Get-ResourceCosts', 'Get-CostByTag', 'Get-CostTrend') })
+        $namedScans = $Scans -and $Scans -notcontains 'All'
+        foreach ($mod in $scanModules) {
+            if ($mod.Fn -notin $liveApiScans) { continue }
+            $mod.LiveApi = $true
+            if (-not $namedScans) { $mod.Selected = $false }
         }
-        $scanModules = @($scanModules | Where-Object { $_.Fn -notin $unsupportedExportScans })
-        Write-FinOpsConsole '  Export mode supports cost totals, resource costs, cost by tag, and the months present in the selected export.' -ForegroundColor Cyan
-        Write-FinOpsConsole '  Other available scans read live inventory or metrics. Financial scans requiring separate APIs are excluded.' -ForegroundColor DarkGray
+        Write-FinOpsConsole '  Export mode reads cost totals, resource costs, cost by tag, and cost trend from the selected export. Inventory, metrics, Advisor, policy, and carbon scans read Azure directly.' -ForegroundColor Cyan
+        Write-FinOpsConsole '  Scans marked (live API) are off by default. Select them to also read budgets, commitments, anomalies, and billing details from Cost Management and billing APIs.' -ForegroundColor DarkGray
     }
 
     # Show active data source
@@ -5120,7 +5134,13 @@ h2[id] { scroll-margin-top: 85px; }
         'Get-BudgetStatus'          = @('Get-CostData')
         'Get-BudgetHistory'         = @('Get-BudgetStatus', 'Get-CostTrend')
     }
-    if ($sourceChoice.Source -eq 'Export') { $deps['Get-CostByTag'] = @('Get-CostData') }
+    if ($sourceChoice.Source -eq 'Export') {
+        $deps['Get-CostByTag'] = @('Get-CostData')
+        # Budget Status takes spend from the Budgets API, and Budget History reads its own
+        # live monthly actuals, so neither needs export cost data in Export mode.
+        $deps.Remove('Get-BudgetStatus')
+        $deps['Get-BudgetHistory'] = @('Get-BudgetStatus')
+    }
     foreach ($depEntry in $deps.GetEnumerator()) {
         if ($depEntry.Key -in $selectedFns) {
             foreach ($req in $depEntry.Value) {
@@ -5145,9 +5165,10 @@ h2[id] { scroll-margin-top: 85px; }
     $global:FinOpsResults = $results
 
     # Step 5: Summary + export
+    $liveSelected = @($finalModules | Where-Object { $_.Selected -and $_.LiveApi })
     $effectiveSource = switch ($sourceChoice.Source) {
         'Hub' { if ($sourceChoice.HubProvider) { "FinOps Hub ($($sourceChoice.HubProvider.ClusterUri), $($sourceChoice.HubProvider.Database))" } else { "FinOps Hub ($($sourceChoice.HubStorage.name))" } }
-        'Export' { "Cost Management export ($($sourceChoice.Export.Name)). $($sourceChoice.CoverageNote)" }
+        'Export' { "Cost Management export ($($sourceChoice.Export.Name)). $($sourceChoice.CoverageNote)$(if ($liveSelected.Count) { " Live API scans: $(($liveSelected | ForEach-Object { $_.Name }) -join ', ')." })" }
         'API' { 'Cost Management API (real-time)' }
         'GraphOnly' { 'Resource Graph only (no cost data)' }
         default { [string]$sourceChoice.Source }
