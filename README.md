@@ -1,5 +1,5 @@
 <!-- markdownlint-disable -->
-# FinOps Explorer TUI
+# FinOps Explorer
 
 An **unofficial, standalone preview snapshot** of the FinOps Explorer terminal
 UI. Download it to run interactive FinOps scans against Azure subscriptions.
@@ -24,8 +24,13 @@ replace their ingestion pipelines or monitor the environment between runs.
 
 ## What's new
 
-Updated November 21, 2026.
+Updated November 23, 2026.
 
+- **New name.** This repository is now
+  [z-larsen/FinOps-Explorer](https://github.com/z-larsen/FinOps-Explorer), and
+  reports and messages say "FinOps Explorer." GitHub redirects links that use
+  the old `FinOps-Explorer-TUI` name. To point an existing clone at the new
+  name, run `git remote set-url origin https://github.com/z-larsen/FinOps-Explorer.git`.
 - **Faster Idle VMs scans.** The scan reads Azure Monitor metrics for up to 50
   VMs in one request, grouped by subscription and region, instead of one request
   per VM. The batch read needs Monitoring Reader on the subscription and runs
@@ -57,7 +62,7 @@ Updated November 21, 2026.
 
 ## Startup screen
 
-![FinOps Explorer TUI startup with the banner and a prompt to choose between scans and the pre-credit forecast.](docs/images/finops-multitool-startup.png)
+![FinOps Explorer startup with the banner and a prompt to choose between scans and the pre-credit forecast.](docs/images/finops-multitool-startup.png)
 
 ## Workflow
 
@@ -65,10 +70,10 @@ Updated November 21, 2026.
 
 ## Download
 
-- [Download the source ZIP](https://github.com/z-larsen/FinOps-Explorer-TUI/archive/refs/heads/main.zip)
+- [Download the source ZIP](https://github.com/z-larsen/FinOps-Explorer/archive/refs/heads/main.zip)
   and extract it into a **new folder**. GitHub normally names that folder
-  `FinOps-Explorer-TUI-main`.
-- Alternatively, clone `https://github.com/z-larsen/FinOps-Explorer-TUI.git`.
+  `FinOps-Explorer-main`.
+- Alternatively, clone `https://github.com/z-larsen/FinOps-Explorer.git`.
 
 No GitHub account is required to download the public source. Keep `Public`,
 `Private`, and `en-US` together with the root files; do not copy just the public
@@ -94,7 +99,7 @@ entry-point script.
 Windows is the documented launch path for this distribution. Native Linux and
 macOS operation has not been verified for this public snapshot.
 
-## Start the TUI
+## Start FinOps Explorer
 
 Open a fresh PowerShell 7 terminal in the extracted folder. After reviewing and
 trusting the downloaded code, unblock the PowerShell files if Windows marked
@@ -180,7 +185,7 @@ exports at management-group ancestors, and exports at linked billing accounts.
 It also discovers likely storage destinations automatically; you don't need to know
 a container name. Container metadata is checked before blob-service enumeration,
 and unavailable locations produce a summary rather than a warning flood. Use
-`-Verbose` for details. CSV parts are loaded into memory; use Kusto for very large datasets.
+`-Verbose` for details. CSV parts are loaded into memory, and a part larger than 512 MB uncompressed stops the read; use Kusto for larger datasets.
 
 Interactive runs can remember export locations for the same Azure cloud, tenant,
 signed-in account, and set of subscriptions. Press Enter to select the last export
@@ -396,7 +401,9 @@ them in `-Scans`, to run them live. `-Scans All` keeps the export default. The
 report marks each live scan, and the cost-source line lists them. If the export
 can't be read, the cost scans report an error; the TUI never fills the gap with
 live Cost Management costs. CSV parts load into
-memory, so use a hub with Kusto for very large datasets.
+memory, and Cost Management writes parts up to 1 GB uncompressed. If a part is larger
+than 512 MB, the error names it; use a hub with Kusto, a local ftklocal Kusto
+emulator, or the Cost Management API for an export that size.
 
 If the message says the export doesn't provide actual cost, it names one of
 these reasons:
@@ -651,14 +658,14 @@ result; a preview scan is not a substitute for reviewing Azure's source data.
 
 Download [Azure Tool Launcher](https://github.com/z-larsen/AzureToolLauncher)
 and set its local configuration's `FinOpsToolkitRoot` to this extracted folder.
-For sibling folders named `AzureToolLauncher` and `FinOps-Explorer-TUI`:
+For sibling folders named `AzureToolLauncher` and `FinOps-Explorer`:
 
 ```powershell
-FinOpsToolkitRoot = '..\FinOps-Explorer-TUI'
+FinOpsToolkitRoot = '..\FinOps-Explorer'
 ```
 
 That setting belongs **inside the launcher's PSD1 configuration**, not at a
-PowerShell prompt. Use `..\FinOps-Explorer-TUI-main` instead if you kept the
+PowerShell prompt. Use `..\FinOps-Explorer-main` instead if you kept the
 ZIP's original folder name. The launcher recognizes the standalone `Public`
 and `Private` layout as well as the alternative `src\powershell` source layout.
 

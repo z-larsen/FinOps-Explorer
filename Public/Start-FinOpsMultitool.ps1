@@ -3,7 +3,7 @@
 
 <#
     .SYNOPSIS
-    Backward-compatible entry point for the FinOps Explorer TUI.
+    Backward-compatible entry point for FinOps Explorer.
 
     .DESCRIPTION
     Start-FinOpsMultitool is retained for existing scripts and sessions. It accepts
