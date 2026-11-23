@@ -277,8 +277,8 @@ function Select-ForecastDiscoveredSources {
     $tenantId = (Get-AzContext).Tenant.Id
     $found = [Collections.Generic.List[object]]::new()
     foreach ($export in @(Find-CostExport -Subscriptions $Subscriptions -IncludeManagementGroups -IncludeBillingAccounts -TenantId $tenantId -SkipRunHistory)) { $found.Add($export) }
-    $known = @{}
-    foreach ($export in $found) { $known[("$($export.StorageResourceId)|$($export.Container)|$($export.RootFolder)|$($export.Name)").ToLowerInvariant()] = $true }
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($export in $found) { if ($export.StorageResourceId -and $export.Container -and $export.Name) { [void]$known.Add((Get-ExportLocationKey $export)) } }
     foreach ($export in @(Find-CostExportFromStorage -Subscriptions $Subscriptions -KnownKeys $known)) { $found.Add($export) }
     $usable = @($found | Where-Object { $_.StorageResourceId -and $_.Container -and $_.Type -notmatch 'Amortized' })
     if ($usable.Count -eq 0) { Write-FinOpsConsole '  No actual-cost or FOCUS exports were found.' -ForegroundColor Yellow; return , [object[]]@() }

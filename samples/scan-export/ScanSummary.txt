@@ -1,4 +1,4 @@
-FinOps Explorer TUI Scan Summary
+FinOps Explorer scan summary
 Generated: 2026-10-03 00:37:37 UTC
 Subscriptions: Contoso-Production-EastUS, Contoso-Production-WestEurope, Contoso-Analytics-Prod, Contoso-Shared-Services, Contoso-Dev-Test, Contoso-Sandbox
 Total findings: 61

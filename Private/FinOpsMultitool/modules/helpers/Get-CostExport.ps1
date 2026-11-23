@@ -23,6 +23,8 @@ param()
 # 1. Find-CostExport          - enumerate exports at each subscription scope
 # 2. Get-CostExportData       - read the newest run's CSV into normalized rows
 # 3. ConvertTo-*FromExport    - shape rows into the cost-tool data contracts
+# 4. *-ExportLocationCache    - remember where a tenant's exports live
+#                               between interactive runs
 #
 # Format: CSV only. Parquet exports are detected and reported but not parsed
 #         natively in PowerShell.
@@ -224,9 +226,13 @@ function Get-StorageContainerList {
 # -- Decompress a gzip blob body into CSV text ----------------------------
 # Newer Cost Management exports can write '.csv.gz' parts. Invoke-RestMethod
 # hands these back as bytes (or a mojibake string); gunzip into UTF-8 text.
+# The CSV reader is the small-dataset path: each part is held in memory, so
+# larger exports belong in a FinOps hub queried through Kusto.
+$script:ExportPartMaxBytes = 512MB
 function Expand-GzipText {
     param($Content, [long]$MaxBytes = 512MB)
     $inStream = $null; $gzip = $null; $outStream = $null
+    $tooLarge = $false
     try {
         $bytes = if ($Content -is [byte[]]) { $Content }
         elseif ($Content -is [string]) { [System.Text.Encoding]::GetEncoding('ISO-8859-1').GetBytes($Content) }
@@ -242,6 +248,7 @@ function Expand-GzipText {
         $buffer = [byte[]]::new(81920)
         while (($read = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
             if (($outStream.Length + $read) -gt $MaxBytes) {
+                $tooLarge = $true
                 throw "Decompressed export part exceeded the $MaxBytes byte ceiling."
             }
             $outStream.Write($buffer, 0, $read)
@@ -250,6 +257,8 @@ function Expand-GzipText {
         return [System.Text.Encoding]::UTF8.GetString($outBytes)
     }
     catch {
+        # A part over the ceiling isn't corrupt, so the caller reports it by name with what to use instead.
+        if ($tooLarge) { throw }
         Write-Warning "  Could not gunzip export part: $($_.Exception.Message)"
         return $null
     }
@@ -322,7 +331,13 @@ function Select-CostExportData {
     $resolved = Resolve-ExportColumns -Header $ExportData.Rows[0].PSObject.Properties.Name
     $costColumn = $resolved.Cost
     if (-not $costColumn -or ($costColumn -ne 'BilledCost' -and $ExportData.CostBasis -ne 'ActualCost')) {
-        throw 'The export does not provide actual cost; BilledCost or an actual-cost dataset is required.'
+        $basis = [string]$ExportData.CostBasis
+        $reason = if (-not $costColumn) { 'it has no recognized cost column' }
+        elseif ($basis -eq 'Usage') { "it's a usage-only export, which leaves out purchases such as reservations and Marketplace, so totals would be understated" }
+        elseif ($basis -eq 'AmortizedCost') { 'it is an amortized cost export, which spreads purchases instead of showing what was billed' }
+        elseif (-not $basis -or $basis -eq 'Unknown') { 'neither the run manifest nor a current export definition confirms the dataset type. If you used a remembered location, choose Search again to check the definition' }
+        else { "its dataset type is $basis" }
+        throw "The export does not provide actual cost because $reason. Use a FOCUS export (BilledCost) or a 'Cost and usage details (actual)' export."
     }
     $expected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $requestedIds = if ($Subscriptions) { @($Subscriptions | ForEach-Object { $_.Id }) } else { @($ExportData.SelectedSubscriptionIds | Where-Object { $_ }) }
@@ -334,11 +349,7 @@ function Select-CostExportData {
     $covered = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $rows = [System.Collections.Generic.List[object]]::new()
     $currency = $null
-    # FOCUS permits a null SubAccountId on tenant-level charges such as MCA
-    # purchases and refunds. They belong to no subscription, so a scoped read
-    # excludes them and reports their count and amount in each currency.
-    $unattributedRows = 0
-    $unattributedCost = [System.Collections.Generic.SortedDictionary[string, double]]::new([System.StringComparer]::Ordinal)
+    $excludedUnscopedCharges = $false
     $getRowCurrency = {
         param($Row)
         $value = if ($costColumn -eq 'CostInUSD') { 'USD' }
@@ -360,12 +371,7 @@ function Select-CostExportData {
         if ($rawId -match '^/subscriptions/([0-9a-fA-F-]{36})(?:/|$)') { $rawId = $Matches[1] }
         if ([string]::IsNullOrWhiteSpace($rawId)) {
             if ($expected.Count -eq 0) { throw 'An export row has no subscription ID; coverage is incomplete.' }
-            $excludedAmount = Get-HubCostValue -Row $row -Column $costColumn
-            $excludedCurrency = & $getRowCurrency $row
-            $excludedTotal = 0.0
-            [void]$unattributedCost.TryGetValue($excludedCurrency, [ref]$excludedTotal)
-            $unattributedCost[$excludedCurrency] = $excludedTotal + $excludedAmount
-            $unattributedRows++
+            $excludedUnscopedCharges = $true
             continue
         }
         if (-not [guid]::TryParse($rawId, [ref]$parsedId)) { throw 'An export row has no valid subscription ID; coverage is incomplete.' }
@@ -399,8 +405,7 @@ function Select-CostExportData {
         PeriodsBySubscription = $period.PeriodsBySubscription
         RowCount = $rows.Count; NoData = ($rows.Count -eq 0); CostBasis = 'ActualCost'
         CoveredSubscriptionIds = @($covered); SelectedSubscriptionIds = @($expected)
-        UnattributedRowCount = $unattributedRows
-        UnattributedCost = @(foreach ($entry in $unattributedCost.GetEnumerator()) { [pscustomobject]@{ Currency = $entry.Key; Cost = $entry.Value } })
+        ExcludedUnscopedCharges = $excludedUnscopedCharges
         ExportCount = $ExportData.ExportCount
         Headers = @($columnMap.Keys); NoCostColumn = $false; CoverageIncomplete = $false
     }
@@ -554,6 +559,127 @@ function Find-CostExport {
     return $found
 }
 
+# -- Remembered export locations -----------------------------------------
+# A remembered location isn't a current export definition.
+$script:ExportLocationFields = @('Name', 'Format', 'Partitioned', 'StorageResourceId', 'Container', 'RootFolder')
+# Version 3 keeps the root folder and export name case-sensitive in lastUsed. Earlier
+# files stored that key lowercased, so they could point at a different export and aren't reused.
+$script:ExportLocationCacheVersion = 3
+
+function Get-ExportLocationKey {
+    # Resource IDs and container names are case-insensitive; blob folder and export names aren't.
+    param([Parameter(Mandatory)][object]$Export)
+    return "$(([string]$Export.StorageResourceId).ToLowerInvariant())|$(([string]$Export.Container).ToLowerInvariant())|$(([string]$Export.RootFolder).Trim('/'))|$($Export.Name)"
+}
+
+function Get-ExportLocationContextKey {
+    param([Parameter(Mandatory)][object]$Context, [Parameter(Mandatory)][string[]]$SubscriptionIds)
+    $cloud = [string]$Context.Environment.Name
+    $properties = $Context.Account.ExtendedProperties
+    $homeAccountId = if ($properties) { [string]$properties['HomeAccountId'] }
+    $principal, $homeTenant = [guid]::Empty, [guid]::Empty
+    $parts = ([string]$homeAccountId).Split('.')
+    if ([string]::IsNullOrWhiteSpace($cloud) -or $parts.Count -ne 2 -or
+        -not [guid]::TryParseExact($parts[0], 'D', [ref]$principal) -or $principal -eq [guid]::Empty -or
+        -not [guid]::TryParseExact($parts[1], 'D', [ref]$homeTenant) -or $homeTenant -eq [guid]::Empty) {
+        throw 'Remembering export locations requires a known Azure cloud and a verified account identifier.'
+    }
+    $ids = @($SubscriptionIds | ForEach-Object { ([guid]::Parse($_)).ToString('D') } | Sort-Object -Unique)
+    $key = @($cloud.Trim().ToLowerInvariant(), ([guid]::Parse($Context.Tenant.Id)).ToString('D'), $principal.ToString('D'), $homeTenant.ToString('D')) + $ids
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key -join "`n"))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+# The same path rules Get-CostExportData enforces, so a hand-edited file can't
+# point the reader somewhere unexpected.
+function Test-ExportLocation {
+    param([AllowNull()][object]$Location)
+    if (-not $Location) { return $false }
+    $name = [string]$Location.Name
+    $container = [string]$Location.Container
+    return (-not [string]::IsNullOrWhiteSpace($name) -and $name -notmatch '[/\\\x00-\x1f]' -and $name -notin @('.', '..') -and
+        [string]$Location.StorageResourceId -match '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Storage/storageAccounts/[a-z0-9]{3,24}$' -and
+        $container -cmatch '^[a-z0-9](?:[a-z0-9-]{1,61})[a-z0-9]\z' -and -not $container.Contains('--') -and
+        [string]$Location.RootFolder -notmatch '(?:^|/)\.{1,2}(?:/|$)|[\\\x00-\x1f]')
+}
+
+function Save-ExportLocationCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}\z')][string]$ContextKey,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Exports,
+        [datetime]$DiscoveredUtc = [datetime]::UtcNow,
+        [bool]$Complete = $true,
+        [string]$LastUsedKey
+    )
+    $privateDirectory = New-FinOpsPrivateDirectory -Path $Directory
+    $path = Join-Path $privateDirectory "$ContextKey.json"
+    $locations = @(foreach ($export in @($Exports | Where-Object { Test-ExportLocation $_ })) {
+            $entry = [ordered]@{}
+            foreach ($field in $script:ExportLocationFields) { $entry[$field] = $export.$field }
+            $entry.Partitioned = [bool]$export.Partitioned
+            $entry.FromEarlierSearch = [bool]$export.FromEarlierSearch
+            $entry
+        })
+    $payload = [ordered]@{
+        version         = $script:ExportLocationCacheVersion
+        contextKey      = $ContextKey
+        discoveredUtc   = $DiscoveredUtc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        complete        = $Complete
+        lastUsed        = $LastUsedKey
+        exports         = $locations
+    }
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        try {
+            $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 5))
+            $stream.Write($bytes, 0, $bytes.Length)
+        }
+        finally { $stream.Dispose() }
+        [IO.File]::Move($temporary, $path, $true)
+    }
+    finally { [IO.File]::Delete($temporary) }
+}
+
+# Returns $null when there's nothing usable, so the caller simply searches again.
+function Read-ExportLocationCache {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}\z')][string]$ContextKey)
+    if (-not [IO.Directory]::Exists($Directory)) { return $null }
+    $privateDirectory = New-FinOpsPrivateDirectory -Path $Directory
+    $path = Join-Path $privateDirectory "$ContextKey.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    $data = $null
+    try { $data = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { Write-Verbose "Remembered export locations could not be read and will be ignored: $($_.Exception.Message)"; return $null }
+    if (-not $data -or $data.version -ne $script:ExportLocationCacheVersion -or $data.contextKey -cne $ContextKey) { return $null }
+    $exports = @(foreach ($location in @($data.exports | Where-Object { Test-ExportLocation $_ })) {
+            $entry = [ordered]@{}
+            foreach ($field in $script:ExportLocationFields) { $entry[$field] = $location.$field }
+            $entry.Partitioned = [bool]$location.Partitioned
+            $entry.FromEarlierSearch = $location.FromEarlierSearch -eq $true
+            $entry.ScopeKind = 'Storage'
+            $entry.Type = 'Unknown'
+            [pscustomobject]$entry
+        })
+    if ($exports.Count -eq 0) { return $null }
+    # ConvertFrom-Json turns ISO 8601 text into a DateTime; older files may still hold text.
+    $discovered = $data.discoveredUtc
+    if ($discovered -isnot [datetime]) {
+        $parsed = [datetime]::MinValue
+        $discovered = if ([datetime]::TryParse([string]$discovered, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { $parsed } else { $null }
+    }
+    return [pscustomobject]@{
+        Exports         = $exports
+        DiscoveredUtc   = if ($discovered) { $discovered.ToUniversalTime() } else { $null }
+        Complete        = [bool]$data.complete
+        LastUsedKey     = [string]$data.lastUsed
+    }
+}
+
 # -- Enumerate storage accounts across the selected subscriptions ---------
 # Storage-first discovery target list. Uses a control-plane list per sub so a
 # cross-tenant Lighthouse hub storage account (readable via delegation) is
@@ -600,20 +726,23 @@ function Get-ExportStorageCandidates {
 # only delegates subscription scope. The definition is invisible, but the
 # blobs land in a storage account we can read. Reconstruct those exports from
 # the blob layout so the export fast path still works. Deduped against
-# control-plane results via -KnownKeys.
+# control-plane results via -KnownKeys: a hashtable keyed by location, or a set of
+# location keys. Keys compare ordinally because blob folder and export names are case-sensitive.
 function Find-CostExportFromStorage {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object[]]$Subscriptions,
         [string]$Environment = 'AzureCloud',
-        [hashtable]$KnownKeys,
+        [object]$KnownKeys,
         [object[]]$StorageAccounts
     )
 
-    if (-not $KnownKeys) { $KnownKeys = @{} }
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $knownSource = if ($KnownKeys -is [Collections.IDictionary]) { $KnownKeys.Keys } else { $KnownKeys }
+    foreach ($key in @($knownSource)) { if ($key) { [void]$known.Add([string]$key) } }
     $suffix = Get-ExportBlobSuffix -Environment $Environment
     $found  = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen   = @{}
+    $seen   = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
     $token = $null
 
@@ -678,7 +807,7 @@ function Find-CostExportFromStorage {
             }
         }
         $knownContainers = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($key in $KnownKeys.Keys) {
+        foreach ($key in $known) {
             $parts = [string]$key -split '\|', 4
             if ($parts.Count -ge 2 -and $parts[0] -eq $sa.ResourceId) { [void]$knownContainers.Add($parts[1]) }
         }
@@ -708,7 +837,7 @@ function Find-CostExportFromStorage {
             # Group CSV parts by their export folder = path before the
             # {dateRange} (YYYYMMDD-YYYYMMDD) token. The segment just before the
             # date range is the export Name; everything earlier is the RootFolder.
-            $groups = @{}
+            $groups = [Collections.Generic.Dictionary[string, Collections.Generic.List[PSCustomObject]]]::new([StringComparer]::Ordinal)
             foreach ($b in $csvBlobs) {
                 $m = [regex]::Match($b.Name, '^(?<folder>.*?)/(?<range>\d{8}-\d{8})/')
                 if (-not $m.Success) {
@@ -729,19 +858,18 @@ function Find-CostExportFromStorage {
                 $name = $segs[-1]
                 $root = if ($segs.Count -gt 1) { ($segs[0..($segs.Count - 2)] -join '/') } else { '' }
 
-                $key = ("$($sa.ResourceId)|$container|$root|$name").ToLowerInvariant()
-                if ($KnownKeys.ContainsKey($key) -or $seen.ContainsKey($key)) { continue }
-                $seen[$key] = $true
+                $key = "$(([string]$sa.ResourceId).ToLowerInvariant())|$container|$root|$name"
+                if ($known.Contains($key) -or -not $seen.Add($key)) { continue }
 
                 $parts   = $groups[$folder]
                 $lastRun = ($parts | ForEach-Object { $_.LastModified } | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1)
                 $partitioned = (@($parts | Where-Object { $_.Name -match '/part_\d+(?:_\d+)?\.csv(?:\.gz)?$' }).Count -gt 1)
 
-                # Infer the cost type from the folder name (best-effort, display only)
+                # Display only: the run's manifest decides the type when the export is read.
                 $type = if ($name -match 'amortiz') { 'AmortizedCost' }
                 elseif ($name -match 'actual') { 'ActualCost' }
                 elseif ($name -match 'focus') { 'FocusCost' }
-                else { 'Usage' }
+                else { 'Unknown' }
 
                 [void]$found.Add([PSCustomObject]@{
                         Name              = $name
@@ -834,6 +962,7 @@ function Get-CostExportData {
     if (-not $manifestBlob -and $requiresManifest) {
         throw 'The export run has no manifest.json, so it might still be writing or be incomplete. No export data was read.'
     }
+    $manifestType = $null
     if ($manifestBlob) {
         $manifestEncoded = (($manifestBlob.Name -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/')
         $manifestBytes = Get-StorageBlobBytes -Uri "$blobBase/$container/$manifestEncoded" -StorageToken $token
@@ -841,6 +970,10 @@ function Get-CostExportData {
         $manifest = $null
         try { $manifest = [System.Text.Encoding]::UTF8.GetString($manifestBytes) | ConvertFrom-Json -ErrorAction Stop }
         catch { throw 'The export run manifest could not be parsed; cost coverage is incomplete.' }
+        # The run's own record of its dataset. It outranks the export definition, and it's
+        # the only reliable type for an export found by scanning storage.
+        if ($manifest.PSObject.Properties.Name -contains 'exportConfig' -and $manifest.exportConfig -and
+            [string]$manifest.exportConfig.type -match '^[A-Za-z]+$') { $manifestType = [string]$manifest.exportConfig.type }
         $declared = @($manifest.blobs)
         if ($declared.Count -eq 0) { throw 'The export run manifest lists no partitions; cost coverage is incomplete.' }
         $foundNames = [Collections.Generic.HashSet[string]]::new([string[]]@($runParts | ForEach-Object { [string]$_.Name }), [StringComparer]::Ordinal)
@@ -873,7 +1006,11 @@ function Get-CostExportData {
         if (-not $bytes) { throw "Export part '$($part.Name)' could not be read; cost coverage is incomplete." }
         $csvText = $null
         if ($part.Name -match '\.gz$') {
-            $csvText = Expand-GzipText -Content $bytes
+            try { $csvText = Expand-GzipText -Content $bytes -MaxBytes $script:ExportPartMaxBytes }
+            catch {
+                $limit = if ($script:ExportPartMaxBytes -ge 1MB) { '{0:N0} MB' -f ($script:ExportPartMaxBytes / 1MB) } else { "$($script:ExportPartMaxBytes) bytes" }
+                throw "Export part '$($part.Name)' is larger than the CSV export reader supports ($limit uncompressed), so no export data was used. Cost Management writes parts up to 1 GB. For an export this size, use a FinOps hub with Kusto, a local ftklocal Kusto emulator, or the Cost Management API."
+            }
         }
         else { $csvText = [System.Text.Encoding]::UTF8.GetString($bytes) }
         if (-not $csvText) { throw "Export part '$($part.Name)' could not be decoded; cost coverage is incomplete." }
@@ -907,7 +1044,7 @@ function Get-CostExportData {
         Headers      = $firstHeader
         NoCostColumn = ($colMap -and -not $colMap.Cost)
         NoData       = ($rows.Count -eq 0)
-        CostBasis    = if ($Export.ScopeKind -eq 'Storage') { 'Unknown' } else { $Export.Type }
+        CostBasis    = if ($manifestType) { $manifestType } elseif ($Export.ScopeKind -eq 'Storage') { 'Unknown' } else { $Export.Type }
     }
 }
 

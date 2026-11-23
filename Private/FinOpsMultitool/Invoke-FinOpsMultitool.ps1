@@ -60,7 +60,7 @@ function Invoke-FinOpsMultitool {
     )
 
     if ($PSVersionTable.PSVersion.Major -lt 7) {
-        throw "FinOps Explorer TUI requires PowerShell 7 or later. This session is PowerShell $($PSVersionTable.PSVersion). Open PowerShell 7 with 'pwsh', import the module there, and run the scan again. No scan was started."
+        throw "FinOps Explorer requires PowerShell 7 or later. This session is PowerShell $($PSVersionTable.PSVersion). Open PowerShell 7 with 'pwsh', import the module there, and run the scan again. No scan was started."
     }
 
     . (Join-Path $PSScriptRoot '../Get-VersionNumber.ps1')
@@ -333,52 +333,121 @@ function Invoke-FinOpsMultitool {
             @($Subscriptions | Where-Object { [string]::IsNullOrWhiteSpace($_.Id) -or $_.TenantId -ne $TenantId }).Count -gt 0) {
             throw 'Export discovery requires the verified selected tenant and subscriptions.'
         }
-        Write-FinOpsConsole "  Reading export definitions for $($Subscriptions.Count) subscription(s), their management-group ancestors, and linked billing accounts..." -ForegroundColor Cyan
-        $exports = @()
-        $discoveryIssues = [Collections.Generic.List[string]]::new()
-        $environmentName = if ($context.Environment.Name) { $context.Environment.Name } else { 'AzureCloud' }
-        $definitionWarnings = @()
-        $storageWarnings = @()
-        try { $exports = @(Find-CostExport -Subscriptions $Subscriptions -Environment $environmentName -TenantId $TenantId -IncludeManagementGroups -IncludeBillingAccounts -SkipRunHistory -WarningAction SilentlyContinue -WarningVariable definitionWarnings) }
-        catch { $discoveryIssues.Add("Export definitions: $($_.Exception.Message)") }
-        if ($definitionWarnings.Count) { Write-FinOpsConsole "  Export definition discovery reported $($definitionWarnings.Count) warning(s). Available choices are retained; use -Verbose for details." -ForegroundColor Yellow }
-        foreach ($warning in @($definitionWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
-        Write-FinOpsConsole "  Export definitions found: $($exports.Count)." -ForegroundColor DarkGray
-        $knownKeys = @{}
-        foreach ($export in $exports) {
-            if ($export.StorageResourceId -and $export.Container -and $export.Name) { $knownKeys["$($export.StorageResourceId)|$($export.Container)|$(([string]$export.RootFolder).Trim('/'))|$($export.Name)".ToLowerInvariant()] = $true }
-        }
-        # Runs even when definitions exist and is deduped against them: a cross-tenant
-        # scan commonly sees some subscriptions' exports while a central
-        # management-group export stays invisible to Cost Management.
-        Write-FinOpsConsole '  Scanning storage accounts in the selected subscriptions for exports Cost Management cannot see...' -ForegroundColor Cyan
-        $definitionCount = $exports.Count
-        $storageSkipped = $false
-        try {
-            $stores = @(Get-ExportStorageCandidates -Subscriptions $Subscriptions -WarningAction SilentlyContinue -WarningVariable storageWarnings)
-            if ($stores.Count -gt 100 -and -not $NonInteractive) {
-                Write-FinOpsConsole "  Found $($stores.Count) storage accounts. Azure allows 100 container listings per 5 minutes in each subscription and region, so scanning them all can be slow." -ForegroundColor Yellow
-                Write-FinOpsConsole "  Scan all $($stores.Count) storage accounts? " -ForegroundColor White -NoNewline
-                Write-FinOpsConsole '(N = skip the storage scan)' -ForegroundColor DarkGray
-                $storageSkipped = (Read-FinOpsAnswer '  Select [Y/N]: ') -notmatch '^(?i)(y|yes)$'
+        # Remembered locations skip the slow definition and storage search on later runs.
+        # Interactive only, so unattended runs stay reproducible and never write state.
+        $cacheDirectory = $null
+        $remembered = $null
+        if (-not $NonInteractive) {
+            try {
+                $contextKey = Get-ExportLocationContextKey -Context $context -SubscriptionIds @($Subscriptions.Id)
+                $cacheDirectory = Join-Path (Split-Path -Path (Get-FinOpsReportRoot) -Parent) 'ExportLocations'
+                $remembered = Read-ExportLocationCache -Directory $cacheDirectory -ContextKey $contextKey
             }
-            if ($storageSkipped) { $discoveryIssues.Add("Export storage: skipped $($stores.Count) storage accounts by choice, so exports Cost Management can't see weren't checked.") }
-            else { $exports += @(Find-CostExportFromStorage -Subscriptions $Subscriptions -StorageAccounts $stores -Environment $environmentName -KnownKeys $knownKeys -WarningAction SilentlyContinue -WarningVariable +storageWarnings) }
+            catch { $cacheDirectory = $null; Write-Verbose "Non-fatal: remembered export locations are unavailable. $($_.Exception.Message)" }
         }
-        catch { $discoveryIssues.Add("Export storage: $($_.Exception.Message)") }
-        if ($storageWarnings.Count) { Write-FinOpsConsole "  Storage discovery reported $($storageWarnings.Count) warning(s). Unreadable locations were skipped, not treated as empty. Available export choices are retained; use -Verbose for details." -ForegroundColor Yellow }
-        foreach ($warning in @($storageWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
-        if (-not $storageSkipped) { Write-FinOpsConsole "  Additional exports found directly in storage: $($exports.Count - $definitionCount)." -ForegroundColor DarkGray }
-        foreach ($issue in $discoveryIssues) { Write-FinOpsConsole "  $issue" -ForegroundColor Yellow }
-        $seen = @{}
+        $useRemembered = $false
+        if ($remembered) {
+            $when = if ($remembered.DiscoveredUtc) { $local = $remembered.DiscoveredUtc.ToLocalTime(); "$($local.ToString('MMMM d, yyyy')) at $($local.ToString('t'))" } else { 'in an earlier run' }
+            Write-FinOpsConsole ''
+            Write-FinOpsConsole "  Remembered export locations for this account and subscription selection: $($remembered.Exports.Count), found $when." -ForegroundColor Cyan
+            if (-not $remembered.Complete) { Write-FinOpsConsole '  That search was incomplete: some export definitions or storage accounts couldn''t be read.' -ForegroundColor Yellow }
+            Write-FinOpsConsole '    1  Use the remembered locations' -ForegroundColor White
+            Write-FinOpsConsole '    2  Search again (export definitions and storage accounts)' -ForegroundColor White
+            $useRemembered = (Read-FinOpsAnswer '  Select [1-2, Enter = 1]: ') -ne '2'
+        }
+        $searchComplete = $true
+        $searchTime = [datetime]::UtcNow
+        if ($useRemembered) {
+            $exports = @($remembered.Exports)
+            $searchComplete = $remembered.Complete
+            Write-FinOpsConsole '  Remembered locations are checked when the export is read. If an export has moved, run again and choose Search again.' -ForegroundColor DarkGray
+        }
+        else {
+            Write-FinOpsConsole "  Reading export definitions for $($Subscriptions.Count) subscription(s), their management-group ancestors, and linked billing accounts..." -ForegroundColor Cyan
+            $exports = @()
+            $discoveryIssues = [Collections.Generic.List[string]]::new()
+            $environmentName = if ($context.Environment.Name) { $context.Environment.Name } else { 'AzureCloud' }
+            $definitionWarnings = @()
+            $storageWarnings = @()
+            try { $exports = @(Find-CostExport -Subscriptions $Subscriptions -Environment $environmentName -TenantId $TenantId -IncludeManagementGroups -IncludeBillingAccounts -SkipRunHistory -WarningAction SilentlyContinue -WarningVariable definitionWarnings) }
+            catch { $discoveryIssues.Add("Export definitions: $($_.Exception.Message)") }
+            if ($definitionWarnings.Count) { Write-FinOpsConsole "  Export definition discovery reported $($definitionWarnings.Count) warning(s). Available choices are retained; use -Verbose for details." -ForegroundColor Yellow }
+            foreach ($warning in @($definitionWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
+            Write-FinOpsConsole "  Export definitions found: $($exports.Count)." -ForegroundColor DarkGray
+            $knownKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($export in $exports) {
+                if ($export.StorageResourceId -and $export.Container -and $export.Name) { [void]$knownKeys.Add((Get-ExportLocationKey $export)) }
+            }
+            # Runs even when definitions exist and is deduped against them: a cross-tenant
+            # scan commonly sees some subscriptions' exports while a central
+            # management-group export stays invisible to Cost Management.
+            Write-FinOpsConsole '  Scanning storage accounts in the selected subscriptions for exports Cost Management cannot see...' -ForegroundColor Cyan
+            $definitionCount = $exports.Count
+            $storageSkipped = $false
+            $namedStore = $null
+            try {
+                $stores = @(Get-ExportStorageCandidates -Subscriptions $Subscriptions -WarningAction SilentlyContinue -WarningVariable storageWarnings)
+                if ($stores.Count -gt 100 -and -not $NonInteractive) {
+                    Write-FinOpsConsole "  Found $($stores.Count) storage accounts. Azure allows 100 container listings per 5 minutes in each subscription and region, so scanning them all can be slow." -ForegroundColor Yellow
+                    Write-FinOpsConsole '  If you know the storage account that holds your exports, enter its name to scan only that one.' -ForegroundColor White
+                    $storageSkipped = $true
+                    $skipReason = "skipped $($stores.Count) storage accounts because no listed name was entered"
+                    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                        $answer = Read-FinOpsAnswer "  Storage account name, Y to scan all $($stores.Count), or N to skip: "
+                        # A listed name wins over the aliases, since 'yes' is a valid storage account name.
+                        # Only an account already listed for the selected subscriptions can be scanned.
+                        $namedStore = @($stores | Where-Object { $_.Name -eq $answer })[0]
+                        if ($namedStore) { $storageSkipped = $false; break }
+                        if ($answer -match '^(?i)(y|yes)$') { $storageSkipped = $false; break }
+                        if ($answer -match '^(?i)(n|no)?$') { $skipReason = "skipped $($stores.Count) storage accounts by choice"; break }
+                        Write-FinOpsConsole "  That name isn't one of the $($stores.Count) storage accounts listed for the selected subscriptions. Check the spelling, or select the subscription that contains it." -ForegroundColor Yellow
+                    }
+                }
+                if ($namedStore) {
+                    $discoveryIssues.Add("Export storage: scanned only $($namedStore.Name) by choice, so the other $($stores.Count - 1) storage accounts weren't checked.")
+                    $stores = @($namedStore)
+                }
+                if ($storageSkipped) { $discoveryIssues.Add("Export storage: $skipReason, so exports Cost Management can't see weren't checked.") }
+                else { $exports += @(Find-CostExportFromStorage -Subscriptions $Subscriptions -StorageAccounts $stores -Environment $environmentName -KnownKeys $knownKeys -WarningAction SilentlyContinue -WarningVariable +storageWarnings) }
+            }
+            catch { $discoveryIssues.Add("Export storage: $($_.Exception.Message)") }
+            if ($storageWarnings.Count) { Write-FinOpsConsole "  Storage discovery reported $($storageWarnings.Count) warning(s). Unreadable locations were skipped, not treated as empty. Available export choices are retained; use -Verbose for details." -ForegroundColor Yellow }
+            foreach ($warning in @($storageWarnings)) { Write-Verbose ([regex]::Replace([string]$warning, '[\p{Cc}\p{Cf}]', ' ')) }
+            if (-not $storageSkipped) {
+                $storageLabel = if ($namedStore) { "in $($namedStore.Name)" } else { 'directly in storage' }
+                Write-FinOpsConsole "  Additional exports found ${storageLabel}: $($exports.Count - $definitionCount)." -ForegroundColor DarkGray
+            }
+            foreach ($issue in $discoveryIssues) { Write-FinOpsConsole "  $issue" -ForegroundColor Yellow }
+            $searchComplete = -not $storageSkipped -and $discoveryIssues.Count -eq 0 -and $definitionWarnings.Count -eq 0 -and $storageWarnings.Count -eq 0
+            # A search that couldn't check everything mustn't erase what an earlier search found.
+            if (-not $searchComplete -and $remembered) {
+                $foundKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($export in $exports) { if ($export) { [void]$foundKeys.Add((Get-ExportLocationKey $export)) } }
+                $kept = @($remembered.Exports | Where-Object { -not $foundKeys.Contains((Get-ExportLocationKey $_)) })
+                foreach ($export in $kept) { $export | Add-Member -NotePropertyName FromEarlierSearch -NotePropertyValue $true -Force }
+                if ($kept.Count) {
+                    $exports += $kept
+                    Write-FinOpsConsole "  This search didn't check everything, so $($kept.Count) remembered location(s) it didn't find are still listed and marked." -ForegroundColor Yellow
+                }
+            }
+        }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $candidates = @($exports | Where-Object {
                 if (-not $_ -or -not $_.StorageResourceId -or -not $_.Container -or -not $_.Name) { return $false }
-                $key = "$($_.StorageResourceId)|$($_.Container)|$(([string]$_.RootFolder).Trim('/'))|$($_.Name)".ToLowerInvariant()
-                if ($seen.ContainsKey($key)) { return $false }
-                $seen[$key] = $true
-                return $true
+                return $seen.Add((Get-ExportLocationKey $_))
             } | Sort-Object Name, StorageResourceId, Container)
+        $saveLocations = {
+            param([string]$LastUsedKey)
+            if (-not $cacheDirectory) { return }
+            try {
+                $discoveredUtc = if ($useRemembered -and $remembered.DiscoveredUtc) { $remembered.DiscoveredUtc } else { $searchTime }
+                Save-ExportLocationCache -Directory $cacheDirectory -ContextKey $contextKey -Exports $candidates -DiscoveredUtc $discoveredUtc -Complete $searchComplete -LastUsedKey $LastUsedKey
+            }
+            catch { Write-Verbose "Non-fatal: export locations were not remembered. $($_.Exception.Message)" }
+        }
         if (-not $candidates.Count) {
+            # A complete search that finds nothing replaces the remembered list, so stale locations aren't offered again.
+            if (-not $useRemembered -and $searchComplete) { & $saveLocations $null }
             if ($OfferApiFallback) {
                 Write-FinOpsConsole ''
                 Write-FinOpsConsole '  No export candidates could be verified for the selected subscriptions.' -ForegroundColor Yellow
@@ -388,14 +457,20 @@ function Invoke-FinOpsMultitool {
             }
             throw 'No export candidates could be verified. Some definitions or destinations may be inaccessible; this does not establish that no exports exist. Check access and network connectivity to the intended export destination, then retry with -Verbose for details.'
         }
+        $lastUsedKey = if ($remembered) { $remembered.LastUsedKey } else { $null }
+        if (-not $useRemembered) { & $saveLocations $lastUsedKey }
         Write-FinOpsConsole '  Export data will be filtered to the selected subscriptions. Missing coverage will not be filled with live API costs.' -ForegroundColor DarkGray
         $readable = @($candidates | Where-Object { [string]$_.Format -match '(?i)^csv' -and -not ($_.ScopeKind -ne 'Storage' -and $_.Type -eq 'AmortizedCost') })
+        $lastUsedIndex = 0
         for ($exportIndex = 0; $exportIndex -lt $candidates.Count; $exportIndex++) {
             $candidate = $candidates[$exportIndex]
             $format = if ($candidate.Format) { $candidate.Format } else { 'Unknown format' }
             $scopeLabel = if ($candidate.ScopeLabel) { $candidate.ScopeLabel } elseif ($candidate.SubName) { $candidate.SubName } else { $candidate.ScopeKind }
             $readableLabel = if ($readable -contains $candidate) { '' } else { ' | not readable by this source' }
-            Write-FinOpsConsole "  [$($exportIndex + 1)] $($candidate.Name) | $format | $($candidate.Type) | $scopeLabel$readableLabel" -ForegroundColor White
+            if ($candidate.FromEarlierSearch) { $readableLabel += ' | from an earlier search' }
+            if ($lastUsedKey -and [StringComparer]::Ordinal.Equals((Get-ExportLocationKey $candidate), $lastUsedKey)) { $readableLabel += ' | last used'; $lastUsedIndex = $exportIndex + 1 }
+            $typeLabel = if ([string]::IsNullOrWhiteSpace([string]$candidate.Type) -or $candidate.Type -eq 'Unknown') { 'type checked when read' } else { $candidate.Type }
+            Write-FinOpsConsole "  [$($exportIndex + 1)] $($candidate.Name) | $format | $typeLabel | $scopeLabel$readableLabel" -ForegroundColor White
             Write-FinOpsConsole "       $($candidate.StorageResourceId) / $($candidate.Container) / $($candidate.RootFolder)" -ForegroundColor DarkGray
         }
         $selectedExport = $null
@@ -407,7 +482,8 @@ function Invoke-FinOpsMultitool {
         }
         else {
             for ($attempt = 0; $attempt -lt 3 -and -not $selectedExport; $attempt++) {
-                $answer = Read-FinOpsAnswer "  Select export [1-$($candidates.Count)] or C to cancel: "
+                $answer = if ($lastUsedIndex) { Read-FinOpsAnswer "  Select export [1-$($candidates.Count)], Enter = $lastUsedIndex (last used), or C to cancel: " } else { Read-FinOpsAnswer "  Select export [1-$($candidates.Count)] or C to cancel: " }
+                if ($answer -eq '' -and $lastUsedIndex) { $answer = [string]$lastUsedIndex }
                 if ($answer -eq 'C') { throw 'Export selection cancelled. No export data was read.' }
                 $selection = 0
                 if ([int]::TryParse($answer, [ref]$selection) -and $selection -ge 1 -and $selection -le $candidates.Count) { $selectedExport = $candidates[$selection - 1] }
@@ -415,6 +491,7 @@ function Invoke-FinOpsMultitool {
             }
         }
         if (-not $selectedExport) { throw 'No export was selected. No export data was read.' }
+        & $saveLocations (Get-ExportLocationKey $selectedExport)
         if ($selectedExport.Format -notmatch '(?i)^csv') { throw "The selected export uses '$($selectedExport.Format)'. This reader supports CSV and CSV.gz exports; it will not switch to live API costs." }
         if ($selectedExport.ScopeKind -ne 'Storage' -and $selectedExport.Type -eq 'AmortizedCost') { throw 'The selected export contains amortized cost. The current export-backed scans require ActualCost or FOCUS BilledCost; no live fallback was attempted.' }
         Write-FinOpsConsole '  CSV parts are loaded into local memory. For very large exports, use a compatible FinOps Hub Kusto database.' -ForegroundColor Yellow
@@ -1146,7 +1223,8 @@ function Invoke-FinOpsMultitool {
         Write-FinOpsConsole ""
         for ($i = 0; $i -lt $Modules.Count; $i++) {
             $mark = if ($Modules[$i].Selected) { 'x' } else { ' ' }
-            Write-FinOpsConsole ("    [{0,2}] [{1}] {2}  ({3})" -f ($i + 1), $mark, $Modules[$i].Name, $Modules[$i].Category)
+            $label = if ($Modules[$i].LiveApi) { "$($Modules[$i].Name) (live API)" } else { $Modules[$i].Name }
+            Write-FinOpsConsole ("    [{0,2}] [{1}] {2}  ({3})" -f ($i + 1), $mark, $label, $Modules[$i].Category)
         }
         Write-FinOpsConsole ""
         Write-FinOpsConsole "  Enter numbers separated by commas, 'all', or blank to keep the [x] defaults." -ForegroundColor DarkGray
@@ -1203,7 +1281,7 @@ function Invoke-FinOpsMultitool {
                 foreach ($mod in $catModules) {
                     $idx = [array]::IndexOf($Modules, $mod)
                     $check = if ($mod.Selected) { '[x]' } else { '[ ]' }
-                    $lines += "     $check $($mod.Name)"
+                    $lines += "     $check $($mod.Name)$(if ($mod.LiveApi) { ' (live API)' })"
                     $lineToIndex[$lines.Count - 1] = $idx
                 }
                 $lines += ''
@@ -1247,7 +1325,7 @@ function Invoke-FinOpsMultitool {
                     elseif ($isActive) { 'White' }
                     elseif ($mod.Selected) { 'DarkGreen' }
                     else { 'Gray' }
-                    Write-FinOpsConsole "  $pointer $check $($mod.Name)" -ForegroundColor $color
+                    Write-FinOpsConsole "  $pointer $check $($mod.Name)$(if ($mod.LiveApi) { ' (live API)' })" -ForegroundColor $color
                 }
             }
 
@@ -1504,32 +1582,36 @@ function Invoke-FinOpsMultitool {
             foreach ($scan in $exportScans) {
                 $permissionInfo[$scan] = @{ Role = 'Storage Blob Data Reader'; Scope = 'Selected export container'; API = 'Azure Storage data API'; Reason = 'Export scans require the selected destination to be readable. Failed reads do not switch to live Cost Management queries.' }
             }
-            try {
-                $rawExport = Get-CostExportData -Export $DataSource.Export -Environment $DataSource.Environment
-                $exportData = Select-CostExportData -ExportData $rawExport -Subscriptions $Subscriptions -SkipCoverageCheck
-                if (-not $exportData.Rows.Count) { throw 'No cost rows match the selected subscriptions.' }
-                $exportSubscriptions = @($Subscriptions | Where-Object { $_.Id -in $exportData.CoveredSubscriptionIds })
-                $missingIds = @($Subscriptions.Id | Where-Object { $_ -notin $exportData.CoveredSubscriptionIds })
-                $unattributedNote = ''
-                if ($exportData.UnattributedRowCount -gt 0) {
-                    $rowLabel = if ($exportData.UnattributedRowCount -eq 1) { 'row' } else { 'rows' }
-                    $amounts = @($exportData.UnattributedCost | ForEach-Object { Format-BudgetAmount -Value $_.Cost -Currency $_.Currency }) -join '; '
-                    $unattributedNote = " Not included in these subscription totals: $($exportData.UnattributedRowCount) export $rowLabel with no subscription ($amounts), such as purchases or refunds billed outside a subscription."
-                }
-                $exportCoverage = [pscustomobject]@{
-                    Name = $DataSource.Export.Name; CoverageIncomplete = ($missingIds.Count -gt 0)
-                    CoveredSubscriptionIds = @($exportData.CoveredSubscriptionIds); UnverifiedSubscriptionIds = $missingIds
-                    TotalSubs = $Subscriptions.Count; ScannedSubs = $exportSubscriptions.Count
-                    UnattributedRowCount = $exportData.UnattributedRowCount; UnattributedCost = @($exportData.UnattributedCost)
-                    ActualPeriod = $exportData.ActualPeriod; DataDate = $exportData.DataDate
-                    Note = "Export rows cover $($exportSubscriptions.Count) of $($Subscriptions.Count) selected subscriptions. Subscriptions without returned rows are unverified, not zero cost. Export period: $($exportData.ActualPeriod).$unattributedNote"
-                }
-                $results['_source_Export'] = $exportCoverage
-                $DataSource.CoverageNote = $exportCoverage.Note
-                Write-FinOpsConsole "  Export loaded: $($exportData.RowCount) selected-scope rows; period $($exportData.ActualPeriod)." -ForegroundColor Green
-                Write-FinOpsConsole "  $($exportCoverage.Note)" -ForegroundColor $(if ($missingIds.Count -or $exportData.UnattributedRowCount) { 'Yellow' } else { 'DarkGray' })
+            if (-not @($selected | Where-Object { $_.Fn -in $exportScans }).Count) {
+                # Only live API, inventory, or metrics scans are selected, so the CSV parts aren't downloaded.
+                $DataSource.CoverageNote = 'No selected scan reads the export, so it wasn''t downloaded.'
             }
-            catch { $exportIssue = "Selected export data is unavailable or incomplete: $($_.Exception.Message)" }
+            else {
+                try {
+                    $rawExport = Get-CostExportData -Export $DataSource.Export -Environment $DataSource.Environment
+                    $exportData = Select-CostExportData -ExportData $rawExport -Subscriptions $Subscriptions -SkipCoverageCheck
+                    if (-not $exportData.Rows.Count) { throw 'No cost rows match the selected subscriptions.' }
+                    $exportSubscriptions = @($Subscriptions | Where-Object { $_.Id -in $exportData.CoveredSubscriptionIds })
+                    $missingIds = @($Subscriptions.Id | Where-Object { $_ -notin $exportData.CoveredSubscriptionIds })
+                    $unattributedNote = ''
+                    if ($exportData.ExcludedUnscopedCharges) {
+                        $unattributedNote = ' These totals exclude charges without a subscription ID.'
+                    }
+                    $exportCoverage = [pscustomobject]@{
+                        Name = $DataSource.Export.Name; CoverageIncomplete = ($missingIds.Count -gt 0)
+                        CoveredSubscriptionIds = @($exportData.CoveredSubscriptionIds); UnverifiedSubscriptionIds = $missingIds
+                        TotalSubs = $Subscriptions.Count; ScannedSubs = $exportSubscriptions.Count
+                        ExcludedUnscopedCharges = $exportData.ExcludedUnscopedCharges
+                        ActualPeriod = $exportData.ActualPeriod; DataDate = $exportData.DataDate
+                        Note = "Export rows cover $($exportSubscriptions.Count) of $($Subscriptions.Count) selected subscriptions. Subscriptions without returned rows are unverified, not zero cost. Export period: $($exportData.ActualPeriod).$unattributedNote"
+                    }
+                    $results['_source_Export'] = $exportCoverage
+                    $DataSource.CoverageNote = $exportCoverage.Note
+                    Write-FinOpsConsole "  Export loaded: $($exportData.RowCount) selected-scope rows; period $($exportData.ActualPeriod)." -ForegroundColor Green
+                    Write-FinOpsConsole "  $($exportCoverage.Note)" -ForegroundColor $(if ($missingIds.Count -or $exportData.ExcludedUnscopedCharges) { 'Yellow' } else { 'DarkGray' })
+                }
+                catch { $exportIssue = "Selected export data is unavailable or incomplete: $($_.Exception.Message)" }
+            }
         }
 
         $srcLabel = switch ($DataSource.Source) {
@@ -1543,19 +1625,25 @@ function Invoke-FinOpsMultitool {
         Write-FinOpsConsole "  $srcLabel" -ForegroundColor $srcColor
         Write-FinOpsConsole ""
 
+        # Web cmdlets draw a "Reading web response stream" bar for every request. Over
+        # hundreds of metric calls it flickers over the scan status and slows each call.
+        # Scoped to this function, so the caller's preference is untouched afterward.
+        $ProgressPreference = 'SilentlyContinue'
+
         foreach ($mod in $selected) {
             $current++
             $pct = [math]::Round(($current / $total) * 100)
             $bar = ('█' * [math]::Floor($pct / 5)).PadRight(20, '░')
 
-            Write-FinOpsConsole "  [$bar] $pct%  ($current/$total) $($mod.Name)" -ForegroundColor White
+            $liveTag = if ($DataSource.Source -eq 'Export' -and $mod.LiveApi) { ' (live API)' } else { '' }
+            Write-FinOpsConsole "  [$bar] $pct%  ($current/$total) $($mod.Name)$liveTag" -ForegroundColor White
 
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             try {
                 $fn = $mod.Fn
                 $output = $null
                 if ($hubScanErrors.ContainsKey($fn)) { throw $hubScanErrors[$fn] }
-                if ($DataSource.Source -eq 'Export' -and $fn -in @('Get-AIWorkloadMetrics', 'Get-UnitEconomics', 'Get-SavingsRealized', 'Get-BudgetHistory', 'Get-BudgetStatus', 'Get-CommitmentUtilization', 'Get-ReservationAdvice', 'Get-AnomalyAlerts', 'Get-BillingStructure', 'Get-ContractInfo', 'Get-MaccCommitment', 'Get-VmCostBreakdown', 'Get-SharedCostAllocation', 'Get-UsageProportionalAllocation')) {
+                if ($DataSource.Source -eq 'Export' -and -not $mod.LiveApi -and $fn -in @('Get-AIWorkloadMetrics', 'Get-UnitEconomics', 'Get-SavingsRealized', 'Get-BudgetHistory', 'Get-BudgetStatus', 'Get-CommitmentUtilization', 'Get-ReservationAdvice', 'Get-AnomalyAlerts', 'Get-BillingStructure', 'Get-ContractInfo', 'Get-MaccCommitment', 'Get-VmCostBreakdown', 'Get-SharedCostAllocation', 'Get-UsageProportionalAllocation')) {
                     throw "$($mod.Name) is not supported by the selected CSV export source. Select API or a supported Hub source explicitly for a separate scan; no live cost fallback was attempted."
                 }
 
@@ -1650,8 +1738,9 @@ function Invoke-FinOpsMultitool {
                         }
                         if ($budgetRows.Count -gt 0) {
                             # Reuse Cost Trend's already-fetched monthly spend so we don't
-                            # re-hit the throttle-prone Cost Management Query API.
-                            $trendResult = if ($results.ContainsKey('Get-CostTrend')) { $results['Get-CostTrend'] } else { $null }
+                            # re-hit the throttle-prone Cost Management Query API. In Export
+                            # mode that trend is the export's, so the live scan reads its own.
+                            $trendResult = if ($DataSource.Source -ne 'Export' -and $results.ContainsKey('Get-CostTrend')) { $results['Get-CostTrend'] } else { $null }
                             $output = & $fn -Budgets $budgetRows -MonthsBack 6 -CostTrend $trendResult
                             if ($budgetResult.CoverageIncomplete) {
                                 $coverageNote = "Budget history covers only the available budget definitions. $($budgetResult.Note)".TrimEnd()
@@ -3464,7 +3553,7 @@ function Invoke-FinOpsMultitool {
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FinOps Explorer TUI Report $reportVersion &mdash; $timestamp</title>
+<title>FinOps Explorer report $reportVersion &mdash; $timestamp</title>
 <style>
 :root {
   --energy-blue: #0000B3; --blue: #0078D4; --navy: #0D0061; --deep-blue: #000085;
@@ -3683,7 +3772,7 @@ h2[id] { scroll-margin-top: 85px; }
 <body>
 <div class="masthead">
 <div class="eyebrow">FinOps Toolkit</div>
-<h1>FinOps Explorer TUI report</h1>
+<h1>FinOps Explorer report</h1>
 <p class="meta">Version: $reportVersion &nbsp;|&nbsp; Generated: $timestamp &nbsp;|&nbsp; Subscriptions: $([System.Net.WebUtility]::HtmlEncode($headerScope))$(if ($DataSourceLabel) { " &nbsp;|&nbsp; Cost data: $([System.Net.WebUtility]::HtmlEncode($DataSourceLabel))" })</p>
 </div>
 <div class="wrap">
@@ -3704,6 +3793,7 @@ h2[id] { scroll-margin-top: 85px; }
                         $notes += [string]$Results['_source_Export'].Note
                         if ($Results['_source_Export'].CoverageIncomplete) { $state = 'Limited data' }
                     }
+                    if ($selectedMod.LiveApi) { $notes += 'Live API scan: read from Cost Management or billing APIs, not from the selected export.' }
                     if ($state -ne 'Failed' -and ($scanData.CoverageIncomplete -contains $true -or $scanData.ComplianceCoverageIncomplete -contains $true -or $scanData.DefinitionCoverageIncomplete -contains $true -or $scanData.AccessDenied -contains $true -or
                             @(@($scanData.CostIssue; $scanData.RateIssue; $scanData.AHBIssue; $scanData.Error) | Where-Object { $_ }).Count -gt 0 -or
                             @($scanData.MetricFailures | Where-Object { $_ -gt 0 }).Count -gt 0 -or
@@ -4611,7 +4701,7 @@ h2[id] { scroll-margin-top: 85px; }
             }
 
             if ($null -ne $currentCat) { [void]$htmlSb.Append('</section>') }
-            [void]$htmlSb.Append('<div class="footer">Generated by FinOps Explorer TUI &mdash; part of the <a href="https://aka.ms/finops/toolkit">FinOps Toolkit</a></div>')
+            [void]$htmlSb.Append('<div class="footer">Generated by FinOps Explorer &mdash; part of the <a href="https://aka.ms/finops/toolkit">FinOps Toolkit</a></div>')
             [void]$htmlSb.Append('</div>')
             [void]$htmlSb.Append(@'
 <script>
@@ -4912,7 +5002,7 @@ h2[id] { scroll-margin-top: 85px; }
 
             # Summary text file
             $summaryLines = @(
-                "FinOps Explorer TUI Scan Summary"
+                "FinOps Explorer scan summary"
                 "Generated: $timestamp"
                 "Subscriptions: $subList"
                 if ($kpiReferenceIssue) { $kpiReferenceIssue }
@@ -4932,7 +5022,8 @@ h2[id] { scroll-margin-top: 85px; }
                     @($summaryData.MetricFailures | Where-Object { $_ -gt 0 }).Count -gt 0) { "Limited data: $(if ($summaryNote) { $summaryNote } else { 'Some evidence could not be verified.' })" }
                 elseif ($count -eq 0) { 'No data' }
                 else { 'Result returned' }
-                $summaryLines += "$($mod.Name): $status"
+                $summaryName = if ($mod.LiveApi) { "$($mod.Name) (live API)" } else { $mod.Name }
+                $summaryLines += "${summaryName}: $status"
             }
             Write-FinOpsReportFile -Directory $exportDir -Name 'ScanSummary.txt' -Lines $summaryLines -ErrorAction Stop
 
@@ -5001,14 +5092,17 @@ h2[id] { scroll-margin-top: 85px; }
         }
     }
     if ($sourceChoice.Source -eq 'Export') {
-        $unsupportedExportScans = @($costModuleFns | Where-Object { $_ -notin @('Get-CostData', 'Get-ResourceCosts', 'Get-CostByTag', 'Get-CostTrend') })
-        if ($Scans -and $Scans -notcontains 'All') {
-            $requestedUnsupported = @($scanModules | Where-Object { $_.Selected -and $_.Fn -in $unsupportedExportScans })
-            if ($requestedUnsupported.Count) { throw "The requested scan(s) are not supported by the CSV export source: $($requestedUnsupported.Fn -join ', '). Select API or Hub explicitly for those scans." }
+        # Scans the export can't answer stay available as live API scans: off by
+        # default, and selected only when the menu or a named -Scans list asks for them.
+        $liveApiScans = @($costModuleFns | Where-Object { $_ -notin @('Get-CostData', 'Get-ResourceCosts', 'Get-CostByTag', 'Get-CostTrend') })
+        $namedScans = $Scans -and $Scans -notcontains 'All'
+        foreach ($mod in $scanModules) {
+            if ($mod.Fn -notin $liveApiScans) { continue }
+            $mod.LiveApi = $true
+            if (-not $namedScans) { $mod.Selected = $false }
         }
-        $scanModules = @($scanModules | Where-Object { $_.Fn -notin $unsupportedExportScans })
-        Write-FinOpsConsole '  Export mode supports cost totals, resource costs, cost by tag, and the months present in the selected export.' -ForegroundColor Cyan
-        Write-FinOpsConsole '  Other available scans read live inventory or metrics. Financial scans requiring separate APIs are excluded.' -ForegroundColor DarkGray
+        Write-FinOpsConsole '  Export mode reads cost totals, resource costs, cost by tag, and cost trend from the selected export. Inventory, metrics, Advisor, policy, and carbon scans read Azure directly.' -ForegroundColor Cyan
+        Write-FinOpsConsole '  Scans marked (live API) are off by default. Select them to also read budgets, commitments, anomalies, and billing details from Cost Management and billing APIs.' -ForegroundColor DarkGray
     }
 
     # Show active data source
@@ -5040,7 +5134,13 @@ h2[id] { scroll-margin-top: 85px; }
         'Get-BudgetStatus'          = @('Get-CostData')
         'Get-BudgetHistory'         = @('Get-BudgetStatus', 'Get-CostTrend')
     }
-    if ($sourceChoice.Source -eq 'Export') { $deps['Get-CostByTag'] = @('Get-CostData') }
+    if ($sourceChoice.Source -eq 'Export') {
+        $deps['Get-CostByTag'] = @('Get-CostData')
+        # Budget Status takes spend from the Budgets API, and Budget History reads its own
+        # live monthly actuals, so neither needs export cost data in Export mode.
+        $deps.Remove('Get-BudgetStatus')
+        $deps['Get-BudgetHistory'] = @('Get-BudgetStatus')
+    }
     foreach ($depEntry in $deps.GetEnumerator()) {
         if ($depEntry.Key -in $selectedFns) {
             foreach ($req in $depEntry.Value) {
@@ -5065,9 +5165,10 @@ h2[id] { scroll-margin-top: 85px; }
     $global:FinOpsResults = $results
 
     # Step 5: Summary + export
+    $liveSelected = @($finalModules | Where-Object { $_.Selected -and $_.LiveApi })
     $effectiveSource = switch ($sourceChoice.Source) {
         'Hub' { if ($sourceChoice.HubProvider) { "FinOps Hub ($($sourceChoice.HubProvider.ClusterUri), $($sourceChoice.HubProvider.Database))" } else { "FinOps Hub ($($sourceChoice.HubStorage.name))" } }
-        'Export' { "Cost Management export ($($sourceChoice.Export.Name)). $($sourceChoice.CoverageNote)" }
+        'Export' { "Cost Management export ($($sourceChoice.Export.Name)). $($sourceChoice.CoverageNote)$(if ($liveSelected.Count) { " Live API scans: $(($liveSelected | ForEach-Object { $_.Name }) -join ', ')." })" }
         'API' { 'Cost Management API (real-time)' }
         'GraphOnly' { 'Resource Graph only (no cost data)' }
         default { [string]$sourceChoice.Source }

@@ -1,6 +1,6 @@
 # Sample scan export
 
-A complete report set from one FinOps Explorer TUI run, so you can see the output format
+A complete report set from one FinOps Explorer run, so you can see the output format
 without running a scan first.
 
 **The data is synthetic.** Subscriptions, resource names, tags, costs, and

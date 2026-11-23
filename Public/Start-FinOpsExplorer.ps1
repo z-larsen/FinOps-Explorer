@@ -3,7 +3,7 @@
 
 <#
     .SYNOPSIS
-    Launches the FinOps Explorer TUI.
+    Launches the FinOps Explorer terminal UI.
 
     .DESCRIPTION
     The Start-FinOpsExplorer command launches an interactive terminal UI (TUI) that
@@ -41,7 +41,8 @@
     .PARAMETER Scans
     Optional list of scans to run, replacing the default selection. Accepts either the
     scan function name, such as Get-OrphanedResources, or its menu label, such as
-    'Orphaned Resources'. Use 'All' on its own to select every scan. An unrecognized name is an error.
+    'Orphaned Resources'. Use 'All' on its own to select every scan; with DataSource Export, 'All'
+    selects the scans the export supports, and live API scans run only when named. An unrecognized name is an error.
     Explicit null or empty lists, and empty entries, are rejected before the tool starts.
 
     .PARAMETER DataSource
@@ -59,8 +60,11 @@
     don't preload hub data. An explicit Hub selection fails if no hub source is available.
     Select API separately to run a live scan. Export also ignores FINOPS_HUB_KUSTO_URI;
     a failed export read never switches to live costs. NonInteractive Export requires
-    exactly one readable discovered candidate. Export mode supports cost totals, resource costs,
-    cost by tag, and the months present in that export run; separate financial API scans are excluded.
+    exactly one readable discovered candidate. Export mode reads cost totals, resource costs,
+    cost by tag, and the months present in that export run from the export. Scans that need
+    Cost Management or billing APIs, such as budgets and commitments, are off by default in
+    Export mode. Select them in the menu or name them in Scans to run them live; 'All' keeps
+    the export default.
 
     .PARAMETER NonInteractive
     Runs without prompting, for automation and scheduled jobs. Every choice comes from the
@@ -79,7 +83,7 @@
     .EXAMPLE
     Start-FinOpsExplorer
 
-    Launches FinOps Explorer TUI. You will be prompted to authenticate and
+    Launches FinOps Explorer. You will be prompted to authenticate and
     select the subscriptions and modules to scan.
 
     .EXAMPLE
@@ -121,7 +125,7 @@ function Start-FinOpsExplorer {
     )
 
     if ($PSVersionTable.PSVersion.Major -lt 7) {
-        throw "FinOps Explorer TUI requires PowerShell 7 or later. This session is PowerShell $($PSVersionTable.PSVersion). Open PowerShell 7 with 'pwsh', import the module there, and run Start-FinOpsExplorer again. No scan was started."
+        throw "FinOps Explorer requires PowerShell 7 or later. This session is PowerShell $($PSVersionTable.PSVersion). Open PowerShell 7 with 'pwsh', import the module there, and run Start-FinOpsExplorer again. No scan was started."
     }
 
     # Locate the Multitool TUI implementation
@@ -129,7 +133,7 @@ function Start-FinOpsExplorer {
     $tuiScript = Join-Path -Path $multitoolRoot -ChildPath 'Invoke-FinOpsMultitool.ps1'
 
     if (-not (Test-Path -Path $tuiScript)) {
-        Write-Error "FinOps Explorer TUI files not found at '$multitoolRoot'. The module installation may be incomplete."
+        Write-Error "FinOps Explorer files not found at '$multitoolRoot'. The module installation may be incomplete."
         return
     }
 

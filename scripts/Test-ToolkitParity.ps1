@@ -1,6 +1,6 @@
 ###########################################################################
 # TEST-TOOLKITPARITY.PS1
-# COMPARE THE STANDALONE FINOPS EXPLORER TUI WITH A TOOLKIT SOURCE CHECKOUT
+# COMPARE THE STANDALONE FINOPS EXPLORER WITH A TOOLKIT SOURCE CHECKOUT
 ###########################################################################
 # Purpose: Detect shared runtime drift without running scans or changing files.
 # Author: Zac Larsen
@@ -62,8 +62,8 @@ foreach ($relativePath in @($sourceFiles.Keys + $targetFiles.Keys | Sort-Object 
                 Replacement = ''
             }
             @{
-                Text = '<title>FinOps Explorer TUI Report $reportVersion &mdash; $timestamp</title>'
-                Replacement = '<title>FinOps Explorer TUI Report &mdash; $timestamp</title>'
+                Text = '<title>FinOps Explorer report $reportVersion &mdash; $timestamp</title>'
+                Replacement = '<title>FinOps Explorer report &mdash; $timestamp</title>'
             }
             @{
                 Text = '<p class="meta">Version: $reportVersion &nbsp;|&nbsp; Generated:'
