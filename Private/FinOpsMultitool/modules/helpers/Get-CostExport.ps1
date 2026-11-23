@@ -226,9 +226,13 @@ function Get-StorageContainerList {
 # -- Decompress a gzip blob body into CSV text ----------------------------
 # Newer Cost Management exports can write '.csv.gz' parts. Invoke-RestMethod
 # hands these back as bytes (or a mojibake string); gunzip into UTF-8 text.
+# The CSV reader is the small-dataset path: each part is held in memory, so
+# larger exports belong in a FinOps hub queried through Kusto.
+$script:ExportPartMaxBytes = 512MB
 function Expand-GzipText {
     param($Content, [long]$MaxBytes = 512MB)
     $inStream = $null; $gzip = $null; $outStream = $null
+    $tooLarge = $false
     try {
         $bytes = if ($Content -is [byte[]]) { $Content }
         elseif ($Content -is [string]) { [System.Text.Encoding]::GetEncoding('ISO-8859-1').GetBytes($Content) }
@@ -244,6 +248,7 @@ function Expand-GzipText {
         $buffer = [byte[]]::new(81920)
         while (($read = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
             if (($outStream.Length + $read) -gt $MaxBytes) {
+                $tooLarge = $true
                 throw "Decompressed export part exceeded the $MaxBytes byte ceiling."
             }
             $outStream.Write($buffer, 0, $read)
@@ -252,6 +257,8 @@ function Expand-GzipText {
         return [System.Text.Encoding]::UTF8.GetString($outBytes)
     }
     catch {
+        # A part over the ceiling isn't corrupt, so the caller reports it by name with what to use instead.
+        if ($tooLarge) { throw }
         Write-Warning "  Could not gunzip export part: $($_.Exception.Message)"
         return $null
     }
@@ -999,7 +1006,11 @@ function Get-CostExportData {
         if (-not $bytes) { throw "Export part '$($part.Name)' could not be read; cost coverage is incomplete." }
         $csvText = $null
         if ($part.Name -match '\.gz$') {
-            $csvText = Expand-GzipText -Content $bytes
+            try { $csvText = Expand-GzipText -Content $bytes -MaxBytes $script:ExportPartMaxBytes }
+            catch {
+                $limit = if ($script:ExportPartMaxBytes -ge 1MB) { '{0:N0} MB' -f ($script:ExportPartMaxBytes / 1MB) } else { "$($script:ExportPartMaxBytes) bytes" }
+                throw "Export part '$($part.Name)' is larger than the CSV export reader supports ($limit uncompressed), so no export data was used. Cost Management writes parts up to 1 GB. For an export this size, use a FinOps hub with Kusto, a local ftklocal Kusto emulator, or the Cost Management API."
+            }
         }
         else { $csvText = [System.Text.Encoding]::UTF8.GetString($bytes) }
         if (-not $csvText) { throw "Export part '$($part.Name)' could not be decoded; cost coverage is incomplete." }
